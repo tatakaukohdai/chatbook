@@ -21,7 +21,9 @@ async function readConfig(overrides: Record<string, string> = {}): Promise<Respo
 describe("GET /api/config", () => {
   it("says web search is there when the deploy names no provider of its own", async () => {
     // Nothing set means DeepSeek, which has the Responses API this uses.
-    const response = await readConfig();
+    // Spelled out rather than left to the ambient bindings: those come from
+    // wrangler.jsonc, so this deploy's own provider would answer instead.
+    const response = await readConfig({ LLM_WEB_SEARCH_SUPPORTED: "" });
 
     expect(response.status).toBe(200);
     expect(await response.json()).toStrictEqual({ webSearchAvailable: true });

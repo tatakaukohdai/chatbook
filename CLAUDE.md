@@ -1388,6 +1388,13 @@ jsdom テストと Workers pool テストは同一プロセスで共存できな
 `LLM_BASE_URL` / `LLM_MODEL` にテスト用の値を渡しているためで、env を読み落とした実装は
 どのハンドラにも当たらずに落ちる（`test/worker/chat.test.ts` の `LLM_BASE` 定数がそれ）。
 
+**LLM の env は `vitest.workers.config.ts` で固定する**。あの設定は `wrangler.jsonc` を読むので、
+**`vars` に書いた値がそのままテストの env になる**。`.dev.vars` があるローカルでは同名の空行が
+それを打ち消すため、**手元では通って CI だけが落ちる**という形で現れる。実際に
+`LLM_WEB_SEARCH_SUPPORTED: "false"` を `vars` に足したとき、Web 検索を on にする
+`chat.test.ts` の 2 本と `config.test.ts` の 1 本が CI でだけ落ちた。デプロイ先の設定に
+左右されてはいけない鍵は、`bindings` に明示して固定すること。
+
 **jsdom 側は `include` を書かず `exclude` だけで拾っている**（`node_modules` / `dist` /
 `test/worker/**` / `e2e/**` / `.claude/**` を除外）。そのため実装とコロケーションした
 `src/server/services/*.test.ts` も自動的に jsdom で走る。バインディングを触らない純粋な

@@ -22,6 +22,10 @@ export default defineConfig({
             // not answer instead of quietly passing on the built-in default.
             LLM_BASE_URL: "https://llm.test",
             LLM_MODEL: "test-model",
+            // Pinned for the same reason: this reads wrangler.jsonc, so a
+            // deploy that declares its provider has no web search would
+            // otherwise decide the outcome of every test that turns it on.
+            LLM_WEB_SEARCH_SUPPORTED: "true",
             // The guard refuses everything when these are missing, so without
             // them every test here would be checking the same 401.
             AUTH_USERNAME: "test-user",
