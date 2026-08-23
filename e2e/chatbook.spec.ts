@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  COVER_TITLE,
   FIGURE_PAGE,
   FIXTURE_FILE_NAME,
   FIXTURE_TITLE,
@@ -239,6 +240,16 @@ async function inkRatio(page: Page): Promise<number> {
 test("adding a PDF from the shelf opens the reader and renders its pages", async ({ page }) => {
   await logIn(page);
   await page.goto("/");
+
+  // The bytes have just gone up, so the viewer must not ask for them back:
+  // on a phone that second trip costs as much as the upload did. Watched from
+  // here rather than in a test of its own — this is the only spec that adds a
+  // book and then reads it.
+  const refetched: string[] = [];
+  page.on("request", (req) => {
+    if (/\/api\/pdf\/[A-Z0-9]+\/file/.test(req.url())) refetched.push(req.url());
+  });
+
   await page.setInputFiles('input[type="file"]', TEST_PDF);
 
   // Uploading navigates into the reader for that book, on its first page. The
@@ -258,6 +269,9 @@ test("adding a PDF from the shelf opens the reader and renders its pages", async
 
   // The cover is text on white, so ink means the glyphs were drawn
   expect(await inkRatio(page)).toBeGreaterThan(0.001);
+
+  // Drawn from the file the reader chose, not from a second download of it
+  expect(refetched).toStrictEqual([]);
 });
 
 /**
@@ -285,6 +299,30 @@ test("a book with CID-keyed fonts renders without asking for a CMap", async ({ p
 
   expect(await inkRatio(page)).toBeGreaterThan(0.001);
   expect(fontErrors).toStrictEqual([]);
+});
+
+/**
+ * WebKit — every iPad browser — ships no async iteration on ReadableStream,
+ * which pdf.js v6's `getTextContent` walks with `for await`. `pdfjsConfig.ts`
+ * installs a polyfill for it, and this is the only runner that exercises that
+ * wiring: the unit test covers the generator alone, and every other run here
+ * has Chromium's native iterator masking a missing install. Stripping the
+ * native iterator before any script runs puts this page where an iPad starts,
+ * so a green run means the polyfill carried both the upload's text extraction
+ * and the page drawing.
+ */
+test("a book still opens where ReadableStream cannot be iterated, the way iPad WebKit ships", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    delete (ReadableStream.prototype as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator];
+  });
+
+  await openTestBook(page);
+
+  // openTestBook has already seen page 1 drawn; make the failure it would
+  // have shown explicit, so a broken polyfill reads as this line, not a timeout.
+  await expect(page.getByText("このページを表示できません", { exact: false })).toHaveCount(0);
 });
 
 test("the shelf lists the book with a real cover image, sizes every card alike, and opens it", async ({
@@ -469,6 +507,34 @@ test("the whole page is visible whether the chat panel is open or folded away", 
   expect(folded.fillsHeight).toBeGreaterThan(0.98);
 });
 
+test("gives the chat the window on the maximize toggle, and the page back on the way out", async ({
+  page,
+}) => {
+  await openTestBook(page);
+
+  const drawnWidth = await settledCanvasWidth(page);
+  const chatPane = page.locator("main > div").last();
+  const paneRow = (await page.locator("main").boundingBox())!.width;
+  expect((await chatPane.boundingBox())!.width).toBeLessThan(paneRow / 2);
+
+  await page.getByRole("button", { name: "チャットを最大化" }).click();
+
+  // Nothing of the page is on screen, and neither is the handle: there is no
+  // second pane beside it left to size.
+  await expect(page.locator("canvas.block").first()).toBeHidden();
+  await expect(page.getByRole("separator", { name: "PDFとチャットの幅を変更" })).toBeHidden();
+  await expect(chatPane.getByText("PDF内のテキストを選択して質問してください")).toBeVisible();
+  expect((await chatPane.boundingBox())!.width).toBeCloseTo(paneRow, 0);
+
+  await page.getByRole("button", { name: "最大化を解除" }).click();
+
+  await expect(page.locator("canvas.block").first()).toBeVisible();
+  // The very same page, down to the pixel. The pane is hidden rather than taken
+  // down or shrunk to nothing, so the viewer is never told its room changed and
+  // never draws the page a second time.
+  expect(await settledCanvasWidth(page)).toBe(drawnWidth);
+});
+
 test("spends the pane's height on the page rather than on a band under it", async ({ page }) => {
   // A window whose page pane is close to as narrow as the page's own
   // proportions, which is where the fit used to run out of width with height to
@@ -617,6 +683,24 @@ async function marksLandInside(page: Page, pageNumber: number): Promise<boolean>
       })
     );
   }, pageNumber);
+}
+
+/**
+ * Drag over a line and read the passage back while the button is still down.
+ *
+ * Read mid-drag on purpose: a held pointer is what tells the viewer the reader
+ * has not finished, so nothing settles and the question box cannot open yet.
+ * Once it does, its own focus collapses the selection there is to read.
+ */
+async function dragAndReadPassage(page: Page, from: Locator, to: Locator): Promise<string> {
+  const start = (await from.boundingBox())!;
+  const end = (await to.boundingBox())!;
+  await page.mouse.move(start.x + 1, start.y + start.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(end.x + end.width - 1, end.y + end.height / 2, { steps: 20 });
+  const passage = await page.evaluate(() => window.getSelection()?.toString() ?? "");
+  await page.mouse.up();
+  return passage;
 }
 
 /** Drag from one end of a drawn line of text to the other. */
@@ -1421,6 +1505,106 @@ test("the chat panel lists the highlights, opens one, and comes back to the list
   await expect(chatPanel.getByPlaceholder("質問を入力...")).toBeHidden();
 });
 
+test("searching the list narrows it to what the server matched", async ({ page }) => {
+  // The chats are searched too, but only the server can see them: an answer
+  // cannot be saved from here without a live model, so the passage is what this
+  // one types. What it does prove is that the box reaches the server at all —
+  // `test/worker/pdf.test.ts` covers the chat half of the same query.
+  const pdfId = await openTestBook(page);
+  const wanted = pageText(2).body[0];
+  const other = pageText(3).body[0];
+  for (const [passage, pageNumber] of [
+    [wanted, 2],
+    [other, 3],
+  ] as const) {
+    await page.request.post(`/api/pdf/${pdfId}/selections`, {
+      data: {
+        selectedText: passage,
+        pageNumber,
+        positionData: {
+          startIndex: 0,
+          endIndex: passage.length,
+          rects: [{ x: 40, y: 40, width: 160, height: 24 }],
+        },
+      },
+    });
+  }
+  await page.reload();
+
+  const chatPanel = page.locator("main > div").last();
+  await expect(chatPanel.getByText("ハイライト 2件", { exact: true })).toBeVisible({
+    timeout: 60000,
+  });
+
+  // Typing is not searching: the list stays whole until the button is pressed
+  await chatPanel.getByLabel("ハイライトを検索").fill(wanted.slice(0, 6));
+  await expect(chatPanel.getByText("ハイライト 2件", { exact: true })).toBeVisible();
+
+  await chatPanel.getByRole("button", { name: "検索" }).click();
+
+  await expect(chatPanel.getByText("ハイライト 2件中 1件", { exact: true })).toBeVisible();
+  await expect(chatPanel.getByText(wanted, { exact: true })).toBeVisible();
+  await expect(chatPanel.getByText(other, { exact: true })).toBeHidden();
+
+  // Emptying the box and searching again gives the whole list back
+  await chatPanel.getByLabel("ハイライトを検索").fill("");
+  await chatPanel.getByRole("button", { name: "検索" }).click();
+  await expect(chatPanel.getByText("ハイライト 2件", { exact: true })).toBeVisible();
+  await expect(chatPanel.getByText(other, { exact: true })).toBeVisible();
+
+  // Enter runs it too, so the box can be used without reaching for the mouse
+  await chatPanel.getByLabel("ハイライトを検索").fill(other.slice(0, 6));
+  await chatPanel.getByLabel("ハイライトを検索").press("Enter");
+  await expect(chatPanel.getByText("ハイライト 2件中 1件", { exact: true })).toBeVisible();
+  await expect(chatPanel.getByText(other, { exact: true })).toBeVisible();
+});
+
+test("a highlight deleted from the list stays gone after a reload", async ({ page }) => {
+  const pdfId = await openTestBook(page);
+  const doomedPassage = pageText(2).body[0];
+  const keptPassage = pageText(3).body[0];
+  for (const [passage, pageNumber] of [
+    [doomedPassage, 2],
+    [keptPassage, 3],
+  ] as const) {
+    await page.request.post(`/api/pdf/${pdfId}/selections`, {
+      data: {
+        selectedText: passage,
+        pageNumber,
+        positionData: {
+          startIndex: 0,
+          endIndex: passage.length,
+          rects: [{ x: 40, y: 40, width: 160, height: 24 }],
+        },
+      },
+    });
+  }
+  await page.reload();
+
+  const chatPanel = page.locator("main > div").last();
+  await expect(chatPanel.getByText("ハイライト 2件", { exact: true })).toBeVisible({
+    timeout: 60000,
+  });
+
+  const doomedRow = chatPanel.locator("li").filter({ hasText: doomedPassage });
+  await doomedRow.getByRole("button", { name: /を削除$/ }).click();
+  await expect(
+    page.getByText("このハイライトを削除しますか？このハイライトのチャット履歴も削除されます。"),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "削除する" }).click();
+
+  await expect(chatPanel.getByText("ハイライト 1件", { exact: true })).toBeVisible();
+  await expect(chatPanel.getByText(doomedPassage, { exact: true })).toBeHidden();
+
+  // The server is what has to have dropped it: a list that only looks right
+  // until the next read would pass everything above.
+  await page.reload();
+  await expect(chatPanel.getByText("ハイライト 1件", { exact: true })).toBeVisible({
+    timeout: 60000,
+  });
+  await expect(chatPanel.getByText(keptPassage, { exact: true })).toBeVisible();
+});
+
 /**
  * Answer one question with a fixed stream, so the citation under test is the
  * test's own rather than whatever the model happens to write.
@@ -1839,4 +2023,28 @@ test("the click that puts the question box away does not also turn the page", as
   // so the edge really was live and the first click was refused on purpose
   await page.mouse.click(box.x + box.width * 0.9, dismissY);
   await expect(drawnPage(page, 2).first()).toBeVisible();
+});
+
+test("copies the passage a reader chose with the question box over it", async ({ page }) => {
+  // Opening the box focuses its field, and that collapses the browser's own
+  // selection — while the overlay keeps drawing the passage as selected. So
+  // Cmd+C used to leave the clipboard holding whatever was in it before.
+  await openTestBook(page);
+  const line = drawnPage(page, 1).first();
+  await expect(line).toBeVisible({ timeout: 60000 });
+
+  // Pinned to the manifest rather than to whatever the drag happened to take:
+  // asserting the paste against the drag's own result would pass on a single
+  // character, and stop noticing if the drag ever stopped covering the line.
+  const passage = await dragAndReadPassage(page, line, line);
+  expect(passage).toBe(COVER_TITLE);
+  const box = page.getByPlaceholder("選択した文章について質問する...");
+  await expect(box).toBeVisible({ timeout: 10000 });
+
+  await page.keyboard.press("ControlOrMeta+c");
+  // Pasted back into the box, which already has the focus: reading the
+  // clipboard directly needs the document focused and flakes when it is not.
+  await page.keyboard.press("ControlOrMeta+v");
+
+  await expect(box).toHaveValue(COVER_TITLE);
 });

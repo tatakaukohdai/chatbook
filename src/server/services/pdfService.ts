@@ -4,6 +4,7 @@ import { desc, eq } from "drizzle-orm";
 import { ResultAsync, err, ok } from "neverthrow";
 import { pdfs, selections } from "../db/schema";
 import type {
+  BookOutline,
   BookSummary,
   PdfMetadata,
   ReadingState,
@@ -51,6 +52,7 @@ interface OpenPdfInput {
   pageCount: number;
   arrayBuffer: ArrayBuffer;
   thumbnail?: ArrayBuffer;
+  outline?: BookOutline;
 }
 
 export type { BookSummary } from "../../shared/schemas/book";
@@ -108,9 +110,12 @@ async function storePdf(
   input: OpenPdfInput,
   idClock: IdClock,
 ): Promise<PdfMetadata> {
-  const { fileName, fileHash, fullText, pageCount, arrayBuffer, thumbnail } = input;
+  const { fileName, fileHash, fullText, pageCount, arrayBuffer, thumbnail, outline } = input;
   const d1Db = drizzle(db);
   const objectKey = pdfObjectKey(fileHash);
+  // Stored like the rest of the metadata: whatever the caller just extracted
+  // wins, and a book whose PDF ships no outline goes back to NULL.
+  const outlineJson = outline ? JSON.stringify(outline) : null;
 
   if (thumbnail) {
     await bucket.put(thumbnailObjectKey(fileHash), thumbnail, {
@@ -134,7 +139,7 @@ async function storePdf(
     // re-opening a book never costs the reader their place in it.
     await d1Db
       .update(pdfs)
-      .set({ fileName, fullText, pageCount, updatedAt: idClock.now() })
+      .set({ fileName, fullText, pageCount, outline: outlineJson, updatedAt: idClock.now() })
       .where(eq(pdfs.id, existing.id));
 
     return {
@@ -160,6 +165,7 @@ async function storePdf(
     fileHash,
     fullText,
     pageCount,
+    outline: outlineJson,
     createdAt: now,
     updatedAt: now,
   });
@@ -283,6 +289,58 @@ function readPositionData(stored: string): PositionData {
 }
 
 /**
+ * The book's highlights whose passage, or whose chat, holds `query`.
+ *
+ * One statement rather than two searches merged afterwards: a highlight matched
+ * by both would otherwise have to be de-duplicated, and the two halves could
+ * land at different times.
+ */
+export function searchSelections(
+  db: D1Database,
+  pdfId: string,
+  query: string,
+): ResultAsync<string[], ServiceError> {
+  return ResultAsync.fromPromise(findSelections(db, pdfId, query), storageFailure).andThen(
+    (found) => (found ? ok(found) : err(notFound())),
+  );
+}
+
+/**
+ * `%` and `_` are LIKE's own; a reader typing one means the character.
+ *
+ * Without this a search for "%" answers with the whole book — which reads as
+ * the search being broken rather than as a wildcard being honoured.
+ */
+function likeContaining(query: string): string {
+  return `%${query.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+}
+
+async function findSelections(
+  db: D1Database,
+  pdfId: string,
+  query: string,
+): Promise<string[] | null> {
+  const d1Db = drizzle(db);
+  const book = await d1Db.select({ id: pdfs.id }).from(pdfs).where(eq(pdfs.id, pdfId)).get();
+  if (!book) return null;
+
+  const needle = likeContaining(query);
+  const rows = await db
+    .prepare(
+      `SELECT s.id FROM selections s
+       WHERE s.pdf_id = ?1
+         AND (s.selected_text LIKE ?2 ESCAPE '\\'
+              OR EXISTS (SELECT 1 FROM chat_messages m
+                         WHERE m.selection_id = s.id AND m.content LIKE ?2 ESCAPE '\\'))
+       ORDER BY s.created_at DESC`,
+    )
+    .bind(pdfId, needle)
+    .all<{ id: string }>();
+
+  return rows.results.map((row) => row.id);
+}
+
+/**
  * Get a PDF record by id, including its selections.
  */
 export function getPdf(db: D1Database, bucket: R2Bucket, pdfId: string) {
@@ -309,6 +367,7 @@ async function readPdf(db: D1Database, bucket: R2Bucket, pdfId: string) {
     fileName: pdf.fileName,
     pageCount: pdf.pageCount,
     hasThumbnail: thumbnail !== null,
+    hasOutline: pdf.outline !== null,
     readingState: readingStateOf(pdf),
     selections: selRows.map((s) => ({
       id: s.id,
