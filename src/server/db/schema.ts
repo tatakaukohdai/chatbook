@@ -50,3 +50,27 @@ export const chatMessages = sqliteTable("chat_messages", {
   cachedInputTokens: integer("cached_input_tokens"),
   createdAt: text("created_at").notNull(),
 });
+
+/**
+ * The reader's own Markdown note about a book, one row per book.
+ *
+ * Off `pdfs` on purpose: that table is read column by column every time a book
+ * is opened, and a note kept there would ride along with the full text on each
+ * of those reads for the sake of a pane that may never be looked at.
+ *
+ * `version` counts saves, not edits. A save names the version it was written
+ * against, and one written against a version the server has moved past comes
+ * back as a conflict the reader can resolve rather than as an overwrite
+ * nobody sees.
+ */
+export const notes = sqliteTable("notes", {
+  id: text("id").primaryKey(),
+  pdfId: text("pdf_id")
+    .notNull()
+    .unique()
+    .references(() => pdfs.id, { onDelete: "cascade" }),
+  body: text("body").notNull(),
+  version: integer("version").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});

@@ -40,8 +40,10 @@ import {
   selectionSearchQuerySchema,
 } from "../../shared/schemas/selection";
 import { sendChatRequestSchema } from "../../shared/schemas/chat";
+import { saveNoteRequestSchema } from "../../shared/schemas/note";
 import type { ErrorCode, ErrorPayload } from "../../shared/schemas/error";
 import { storageFailure, type ServiceError } from "../services/serviceError";
+import { getNote, saveNote } from "../services/noteService";
 import { readStoredOutline, selectExcerpt } from "../services/documentExcerpt";
 import { validate } from "./validation";
 
@@ -448,6 +450,40 @@ export function createPdfRoute(idClock: IdClock = systemIdClock) {
           );
         },
       )
+      // The reader's own note about the book. Its own table and its own pair of
+      // endpoints, so opening a book never reads a note nobody asked for.
+      .get("/pdf/:pdfId/note", async (c) => {
+        const note = await getNote(c.env.DB, c.req.param("pdfId"));
+
+        return note.match(
+          (found) => c.json(found),
+          (failure) => serviceFailureResponse(c, failure, PDF_NOT_FOUND),
+        );
+      })
+      // Saving names the version the text was written against, and a save that
+      // names a version the note has moved past is refused with the note it
+      // lost to — the only refusal here that carries more than its reason,
+      // because neither a rebase nor a merge can begin without the other side.
+      .put("/pdf/:pdfId/note", validate("json", saveNoteRequestSchema), async (c) => {
+        const saved = await saveNote(c.env.DB, c.req.param("pdfId"), c.req.valid("json"), idClock);
+
+        return saved.match(
+          (outcome) =>
+            outcome.type === "SAVED"
+              ? c.json({ version: outcome.version })
+              : c.json(
+                  {
+                    error: {
+                      code: "NOTE_CONFLICT" satisfies ErrorCode,
+                      message: "Note changed since it was read",
+                    },
+                    current: outcome.current,
+                  },
+                  409,
+                ),
+          (failure) => serviceFailureResponse(c, failure, PDF_NOT_FOUND),
+        );
+      })
       .get("/pdf/:pdfId", async (c) => {
         const book = await getPdf(c.env.DB, c.env.PDF_BUCKET, c.req.param("pdfId"));
 

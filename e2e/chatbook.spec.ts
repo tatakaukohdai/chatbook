@@ -126,6 +126,31 @@ function placeSaved(page: Page): Promise<unknown> {
   );
 }
 
+/**
+ * Empty the book's note, which is kept on the server like the place is.
+ *
+ * The same trap the highlights and the reading position are reset for: the
+ * three specs upload the same file, so they share one `pdfId`, and a note left
+ * behind by an earlier test would be what the next one opens on. Emptied
+ * rather than deleted — there is no endpoint that deletes a note, and none is
+ * wanted: an empty note and no note read the same to the reader.
+ *
+ * Says whether it had to empty one, because the reader is already holding the
+ * note by the time this runs: the session read it on the way in and saves
+ * against the version it read, so a page that is not loaded again would send
+ * its first save against a version this has just moved past — and meet a
+ * conflict of the test harness's own making.
+ */
+async function clearNote(page: Page, pdfId: string): Promise<boolean> {
+  const note = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    body: string;
+    version: number;
+  };
+  if (note.body === "") return false;
+  await page.request.put(`/api/pdf/${pdfId}/note`, { data: { body: "", version: note.version } });
+  return true;
+}
+
 async function openTestBook(page: Page): Promise<string> {
   await logIn(page);
   await page.goto("/");
@@ -150,10 +175,11 @@ async function openTestBook(page: Page): Promise<string> {
   await page.request.put(`/api/pdf/${pdfId}/reading-state`, {
     data: { page: 1, selectionId: null, outlineOpen: true, chatPanelOpen: true },
   });
+  const noteWasWrittenIn = await clearNote(page, pdfId);
 
   // Reload only where the reader is showing something the reset has just
   // replaced: a second load of the book costs as much as the first one.
-  if (selections.length > 0 || resumedElsewhere(readingState)) {
+  if (selections.length > 0 || resumedElsewhere(readingState) || noteWasWrittenIn) {
     await page.goto(`/books/${pdfId}?page=1`);
   }
   // A tap or a drag needs the page itself to have been drawn, not merely the
@@ -2047,4 +2073,58 @@ test("copies the passage a reader chose with the question box over it", async ({
   await page.keyboard.press("ControlOrMeta+v");
 
   await expect(box).toHaveValue(COVER_TITLE);
+});
+
+test("what the reader writes in the note is still there after a reload", async ({ page }) => {
+  // The whole stack in one go: the pane's textarea, the session behind it, the
+  // debounced save, and the row in D1. The note is the one thing here a reader
+  // would mind losing a paragraph of, so nothing short of coming back to it in
+  // a fresh page load is evidence that it was kept.
+  const pdfId = await openTestBook(page);
+
+  await page.getByRole("tab", { name: "メモ" }).click();
+  await page
+    .getByRole("textbox", { name: "読書メモ" })
+    .fill("## 3 章\n\nRaft の前提が省かれている\n");
+  await expect(page.getByText("保存済み")).toBeVisible({ timeout: 15000 });
+
+  await page.goto(`/books/${pdfId}?page=1`);
+  await page.getByRole("tab", { name: "メモ" }).click();
+
+  await expect(page.getByRole("textbox", { name: "読書メモ" })).toHaveValue(
+    "## 3 章\n\nRaft の前提が省かれている\n",
+  );
+  // Rendered beside the source, so the reader can see what the marks did
+  await expect(page.getByRole("heading", { name: "3 章" })).toBeVisible();
+});
+
+test("a note written against a version the server has moved past is folded in rather than lost", async ({
+  page,
+}) => {
+  // Two devices, which is this app's premise — the reading position exists for
+  // it. Here the other one saves while this one is writing, and neither side's
+  // words may go missing over it.
+  const pdfId = await openTestBook(page);
+  await page.getByRole("tab", { name: "メモ" }).click();
+
+  const editor = page.getByRole("textbox", { name: "読書メモ" });
+  await editor.fill("# Raft\n\n選挙の話\n");
+  await expect(page.getByText("保存済み")).toBeVisible({ timeout: 15000 });
+
+  // The other device, writing somewhere this one has not touched
+  const before = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    version: number;
+  };
+  await page.request.put(`/api/pdf/${pdfId}/note`, {
+    data: { body: "# Raft\n\n選挙の話\n\n## ログ複製\n", version: before.version },
+  });
+
+  await editor.fill("# Raft\n\n選挙の話（過半数）\n");
+
+  // Refused as stale, folded onto what the server holds, and sent again — all
+  // without the reader being asked anything, because the two edits never met
+  await expect(editor).toHaveValue("# Raft\n\n選挙の話（過半数）\n\n## ログ複製\n", {
+    timeout: 15000,
+  });
+  await expect(page.getByText("保存済み")).toBeVisible({ timeout: 15000 });
 });

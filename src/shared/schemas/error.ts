@@ -16,6 +16,7 @@ export const ERROR_CODES = [
   "AI_API_ERROR",
   "AI_STREAM_ERROR",
   "CHAT_SAVE_FAILED",
+  "NOTE_CONFLICT",
   "ROUTE_NOT_FOUND",
   "INTERNAL_ERROR",
 ] as const;

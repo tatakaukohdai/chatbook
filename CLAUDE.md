@@ -68,7 +68,7 @@ commit 済みの `worker-configuration.d.ts` は `.dev.vars.example` の並び�
 `// oxlint-disable-next-line no-restricted-imports -- <理由>` を付けて理由を明記する運用にしている。
 新しく足すときも同じように理由を書くこと。
 
-現在 12 ファイルに理由コメントがあり、内訳は次の 5 つしかない。新しく足す `useEffect` も
+現在 13 ファイルに理由コメントがあり、内訳は次の 5 つしかない。新しく足す `useEffect` も
 このどれかに当てはまるはずで、当てはまらないなら書き方を疑うこと:
 
 | 用途                                                    | ファイル                                                                                                                                                                                                                                                   |
@@ -77,7 +77,7 @@ commit 済みの `worker-configuration.d.ts` は `.dev.vars.example` の並び�
 | `document` / `window` / `ResizeObserver` の購読         | `useKeyboardShortcuts.ts`、`SettingsMenu.tsx`、`SelectionPopover.tsx`、`PdfViewer.tsx`、`useSettledSelection.ts`（`document` の `selectionchange` と `window` の pointer 系）                                                                              |
 | 非 passive なジェスチャの購読（ブラウザの既定を止める） | `PdfViewer.tsx`（ctrlKey wheel のピンチ、touch と Safari の gesture イベント）                                                                                                                                                                             |
 | DOM への命令的な書き込み（スクロール位置）              | `ChatMessageList.tsx`（最下部へ追随）、`PdfViewer.tsx`（ページ遷移時のリセット）                                                                                                                                                                           |
-| URL とサーバという React の外の状態への同期             | `useReadingLocation.ts`、`useReadingStateSync.ts`（読書位置の保存と離脱時の書き残し）                                                                                                                                                                      |
+| URL とサーバという React の外の状態への同期             | `useReadingLocation.ts`、`useReadingStateSync.ts`（読書位置の保存と離脱時の書き残し）、`useNoteSession.ts`（メモのデバウンス保存）                                                                                                                         |
 
 **画面幅の購読には `useEffect` を使わない**。`useIsNarrow`（`src/front/hooks/useIsNarrow.ts`）が
 `useSyncExternalStore` で `matchMedia` を購読する。購読するのは幅そのものではなく
@@ -308,6 +308,9 @@ union + `satisfies` で固定する。
   現在の該当箇所は本の削除（`ShelfPage`）・ハイライトの作成（`useAskAboutSelection`）・
   ハイライトの削除（`useHighlights`）・チャット履歴の取得（`AppPage`）・読書位置の保存
   （`useReadingStateSync`）・ログイン（`RequireSession`）・ログアウト（`SettingsMenu`）の 7 つ。
+  **メモの保存（`noteApi.ts` の `requestNoteSave`）だけはこれを通さない**——409 が封筒の中に
+  競合相手の本文を積んで返すのに、`resultFetcher` は拒否本文から `{ error }` しか読まないため
+  （下記「読書メモ」）。
   **例外は `usePdfDocument.ts` の `storeCoverIfMissing` / `storeOutlineIfMissing` の 2 つ**で、
   これらは失敗を出さないと決めた書き込み（下記「意図的に握りつぶす」）なので
   `fetcher` + try/catch のままでよい
@@ -356,6 +359,9 @@ union + `satisfies` で固定する。
 | チャットの送信・履歴の取得                 | `chatErrorAtom`                                       | チャットパネル（狭い画面ではシート）                                             |
 | リンク先の passage が見つからない          | `useReadingLocation` の `passageMiss`                 | ヘッダ直下の帯                                                                   |
 | 読書位置の保存                             | `useReadingStateSync` の `saveError`                  | ヘッダ直下の帯                                                                   |
+| メモの読み込み                             | `useNoteSession` の `loadError`                       | メモタブの上部                                                                   |
+| メモの保存（競合を含む）                   | `useNoteSession` の `status` と `saveError`           | メモタブのツールバー（**失敗だけでなく常に状態を出す**）                         |
+| メモの下書きを端末に置けない               | `useNoteSession` の `draftError`                      | 同じ枠の下                                                                       |
 
 `chatErrorAtom` だけ二重の口がある。**atom が表示の正、`sendMessage` の戻り値
 （`ResultAsync<string, ApiError>`。成功時の値は保存された回答の id）は呼び出し元の
@@ -364,7 +370,7 @@ union + `satisfies` で固定する。
 
 #### 意図的に握りつぶす
 
-次の 12 行は失敗を画面に出さない（`HighlightListPanel.tsx` の行だけは、出す場所が残って
+次の 13 行は失敗を画面に出さない（`HighlightListPanel.tsx` の行だけは、出す場所が残って
 いれば出す）。いずれも理由をコメントに書いてあり、**理由を書かずに握りつぶしを増やさない
 こと**:
 
@@ -382,6 +388,7 @@ union + `satisfies` で固定する。
 | `useReadingStateSync.ts` の離脱時の flush                          | 送る先の画面がもう無い（本棚へ戻る・タブを閉じる）                                                               |
 | `HighlightListPanel.tsx` の削除失敗（一覧を離れていたとき）        | 出す場所がもう無い（チャットを開くと一覧ごと畳まれる）。消えなかったハイライトはそこに在るので、戻れば試し直せる |
 | `useServerConfig.ts` の取得失敗                                    | Web 検索は「あり」と仮定して進む。送ってもサーバが落とす                                                         |
+| `noteDraft.ts` の `clearDraft`                                     | 消し残した下書きは次のメモにしか読まれず、次の保存で消える（**書き込みの失敗は出す**。下記「読書メモ」）         |
 
 **報告しないためではなく報告する主体が別**という catch が 2 つある。`SelectionPopover` の
 `onSubmit` を囲むもの（質問の失敗は `useAskAboutSelection` が受け持つ。ここで再 throw すると
@@ -555,6 +562,157 @@ be iterated…」**（ネイティブの iterator を消してから本を開く
 途中経過なので、上の実測だけが根拠）はどのテストも通らない。**E2E も無い**——チャットの送信には
 実キーが要る（上記「worktree を作ったら最初に `.dev.vars` を用意する」）ので、手で見るなら
 メインクローンの `LLM_API_KEY` を入れ、長い回答の途中で上へスクロールする。
+
+### 読書メモ
+
+本ごとに 1 枚の Markdown 文書。設計は `docs/superpowers/specs/2026-08-23-reading-notes-design.md`
+が正で、**現在入っているのは Phase 1（メモ本体）だけ**——PDF からの挿入・チャットの転載・
+ダウンロードはまだ無い。**機能そのものは素直で、難しさは保存と競合の扱いに集中している。**
+
+| 何を                                   | どこに                                                                |
+| -------------------------------------- | --------------------------------------------------------------------- |
+| D1 のテーブル                          | `migrations/0005_add_notes.sql`、`src/server/db/schema.ts` の `notes` |
+| 保存と読み出しの service               | `src/server/services/noteService.ts`                                  |
+| 2 本のエンドポイント                   | `src/server/routes/pdf.ts`（`GET` / `PUT /pdf/:pdfId/note`）          |
+| front と server が交わす形             | `src/shared/schemas/note.ts`                                          |
+| 409 を読む専用の save                  | `src/front/lib/noteApi.ts`                                            |
+| 3-way マージ（行単位）                 | `src/front/lib/noteMerge.ts`（`node-diff3` の `merge`）               |
+| 端末に残す下書き                       | `src/front/lib/noteDraft.ts`（`chatbook:note-draft:<pdfId>`）         |
+| ツールバーの純関数                     | `src/front/lib/markdownCommands.ts`                                   |
+| 書き込みを 1 本にまとめる note session | `src/front/hooks/useNoteSession.ts`                                   |
+| 画面                                   | `src/front/components/NotePane/NotePane.tsx`、タブは `ChatArea`       |
+
+**`pdfs` に列を足していない。** `readPdf` / `storePdf` は drizzle が全列を明示列挙するので、
+メモを載せると本を開くたびに `full_text`（実書籍で 213KB）に加えてメモまで D1 から読むことに
+なる（上記「応答に使わない列を select しない」に反する）。別テーブルなので
+`GET /api/pdf/:pdfId` は一切変わっていない。
+
+#### 保存の規約は読書位置とわざと違う
+
+CLAUDE.md は読書位置について「保存に失敗しても再送はしない」「後に書いた方が勝つ」と定めて
+いるが、**この規約をメモに持ち込むと文章が消える**。ページ番号を失うことと段落を失うことは
+別の事故なので、次の 4 点だけ変えてある。
+
+- **保存状態を常時見せる**（`NotePane` のツールバー右端。`saved` / `dirty` / `saving` /
+  `failed` / `conflicted`）。読書位置は失敗したときだけ帯を出すが、書いたものがサーバに
+  あると確認できないエディタは信用されない
+- **`localStorage` に下書きを鏡写しする。** 離脱時 flush は読書位置（数十バイト）なら
+  `keepalive` で運べるが、**育ったメモは 64KB 上限を超えうる**。だから `useNoteSession` に
+  `pagehide` の flush は無い
+- **競合を検出する**（`version` 列 1 本と `WHERE` 句 1 つ）。端末をまたいで同じ本を開くのは
+  このアプリの前提そのもの
+- **保存のたびに確認する。** 別の往復でサーバの状態を見に行くことはせず、`PUT` 自体が確認を
+  兼ねる
+
+#### 保存は 1 文の条件付き UPSERT
+
+`noteService.ts` の `writeNote` が `INSERT ... ON CONFLICT(pdf_id) DO UPDATE ... WHERE
+notes.version = ?` を 1 文で撃つ。**「先に UPDATE し、行が無ければ INSERT」にしてはいけない**
+——2 端末が同時に空のメモを読み、どちらも `version: 0` で初めて保存すると、一方が `pdf_id` の
+unique 違反で 500 になる（読者から見れば壊れているようにしか見えないが、実際に起きているのは
+解決できる競合）。`RETURNING` が 0 行なら競合で、そのとき初めて現在の `{ body, version }` を
+読み直す。**読み直すのは refusal のあと**——読者に見せるのは「サーバはいまこうなっている」で
+あって、特定の版ではない。
+
+**競合はサーバ側でも障害ではない。** `ServiceError`（`NOT_FOUND` / `STORAGE`）を増やさず、
+service が `SAVED` / `CONFLICT` の判別可能な**成功値**を route へ返す。増やすと既存の
+`.match()` 全部が「無い本」「応答しないストア」と並べて競合を扱うことになる。
+
+**409 は封筒の中に競合相手の本文を積んで返す**（`{ error, current }`。`noteConflictSchema`）。
+ここが `resultFetcher` の既定と噛み合わない唯一の場所で、あれは拒否本文から `{ error }` しか
+読まない。**素通しすると競合相手の本文が捨てられ、リベースも 3-way マージもできない**ので、
+front は汎用の `resultFetcher` を変えずに `noteApi.ts` の `requestNoteSave` で 409 だけを
+`{ type: "CONFLICT"; current }` に翻訳する。**409 が `current` を持たないときは
+`readRefusal` に戻す**（文言を 2 箇所で作らないため）。
+
+#### 書き込みは 1 つの note session に集約する
+
+`useNoteSession` は `BookReader`（`AppPage.tsx`）に 1 つだけ置き、`ChatArea` へ props で配る。
+メモが埋まる経路は最終的に 4 つ（自分で書く・PDF の選択箇所を挿入・クイックメモ・チャットの
+転載）あり、**それぞれが勝手に `GET` / `PUT` すると、別の端末より先に同じブラウザ自身が競合
+する**。1 冊につき 1 つの session が、サーバ版・編集中の本文・保存キューをまとめて持つ。
+
+- **サーバ版は `baseBody` / `baseVersion` に 1 度だけ入力する**（`useSWRImmutable` が解いた値。
+  上記「SWR が持っているものを atom へ写すのも理由にならない」の、`useReadingLocation` が
+  認めている「一度きりの入力」と同じ線引き）。そのあと画面の本文は読者のもので、base は
+  マージの基準にしか使わない
+- **保存は single-flight。** `PUT` の送信中に本文が変わっても 2 本目を並行して送らず、先の
+  応答で base を進めてから残りを送る。**ここを外すと 2 本目が同じ version を名乗り、自分自身と
+  競合する**（`useNoteSession.test.tsx` の「keeps typing that lands mid-save…」が唯一の見張り）
+- **409 は現在のローカル本文 / base / サーバ版で 3-way マージし、サーバ版を新しい base として
+  再送する。** 自動融合できれば読者は競合が起きたことを知らなくてよい
+- **マーカーが残れば `conflicted` にして自動保存を止める**。読者がマーカーを消した時点で
+  `dirty` に戻り、保存が再開する（`hasConflictMarkers`）
+- **再送には上限を設ける**（`MAX_CONFLICT_RETRIES` = 3）。別端末が保存を続けている間
+  409 → 融合 → 再送はループしうる。上限に達したら `conflicted` に落として読者に委ねる
+- **保存に失敗したら `failed` のまま置く**。再送はせず、次の編集が再試行を兼ねる
+
+#### マージは行単位で、`node-diff3` を使う
+
+jsdiff（`diff` パッケージ）の `merge` は誤った結果を返す不具合を理由に v8 で削除されている
+（そもそもあれは patch のマージで、ここで欲しい 3-way とは別物だった）。
+
+**文字列をそのまま渡さないこと**——既定では空白単位に分割されるので、触っていない段落まで
+組み直される。`noteMerge.ts` の `toLines` / `fromLines`（`split("\n")` と `join("\n")`。
+互いの逆関数なので末尾改行も連続する空行もそのまま戻る）で行配列にしてから渡す。
+`excludeFalseConflicts` を付けるのは、両端末が同じ直しを入れたときに読者へ「同じ行と同じ行の
+どちらを取るか」を尋ねないため。ラベルは `自分` / `サーバ`（git の言葉ではない）。
+
+**マーカーの判定は行頭アンカー**（`CONFLICT_MARKER`）。分散システムの本を読みながらマージの
+話を引用する読者は珍しくないので、`> <<<<<<< 自分` のような本文で保存を止めない。
+
+#### 下書きは base を同伴し、時刻で新旧を判定しない
+
+端末間で時計は一致しないので、`NoteDraft` は `{ body, baseBody, baseVersion }` を持つ。
+判定は時刻ではなく本文で行い、`draft.body` がサーバ本文と同じなら削除、base が同じなら
+未保存の下書きとして**復帰を提案する**（勝手に当てない——サーバ版は他の端末が合意している
+ものなので、この端末の残り物で黙って上書きしない）。サーバ版が進んでいれば、復帰を選んだ
+ときに draft / base / server を 3-way マージする。
+
+**削除するのは、現在の本文までサーバに載ったと確認できたときだけ**（`body === baseBody`）。
+**下書きを作るのは広い画面だけ**（編集するのが広い画面だけなので）だが、**広い画面で作った
+未保存の下書きは、リサイズや回転で狭いレイアウトになっても捨てない**——「新しく作らない」ことと
+「既にあるものを消す」ことは別。JSON の破損は「下書き無し」に落とし（保険のために画面を
+落とさない）、`QuotaExceededError` は `draftError` として**保存状態の近くに出す**（黙って
+握りつぶすと、読者は保険があると思ったまま書き続ける）。
+
+#### 狭い画面に textarea を置かないことが競合の扱いを決めている
+
+広い画面は右ペインのタブ（`ChatArea` の `rightPaneTabAtom`）で、textarea + ライブプレビュー +
+ツールバー + 保存状態。**狭い画面はプレビューだけで、編集はしない。** 電話で起きるのは
+「気になった箇所を投げ込む」であって「腰を据えて文章を書く」ではなく、狭い textarea で
+消耗する道を塞ぐ。
+
+**この判断が「電話に競合の UI が要らない」を成立させている。**（Phase 2 で足す狭い画面の
+クイックメモは「決まったセクションの末尾に足す」だけなので、409 でも同じ追記をやり直せば
+意味が変わらない。）**あとから電話に textarea を足すなら、競合の扱いを設計し直すこと。**
+
+3 ペインにも引き出しにもしないのは、どちらも PDF の表示領域を削るため。CodeMirror や
+ProseMirror は入れない（重いうえ、ソースが正であることを保つのが結局いちばん強い）。
+Markdown の見た目は `src/front/components/markdownComponents.tsx` の `MARKDOWN_COMPONENTS`
+をチャットの回答と共有する（メモの見出しと回答の見出しが同じ大きさになる）。
+
+#### テスト
+
+| 何を                                                     | どこで                                                  |
+| -------------------------------------------------------- | ------------------------------------------------------- |
+| version 0 の同時初回保存が 500 にならず片方が 409        | `test/worker/note.test.ts`                              |
+| 存在しない PDF の GET / PUT が 404、本と一緒に消えること | 同上                                                    |
+| 3-way マージ（自動融合・マーカー・空本文・末尾改行）     | `src/front/lib/noteMerge.test.ts`                       |
+| ツールバーの純関数とキャレットの行き先                   | `src/front/lib/markdownCommands.test.ts`                |
+| 409 の `current` が `CONFLICT` へ届くこと                | `src/front/lib/noteApi.test.ts`                         |
+| 下書きの読み書き・破損 JSON・容量超過                    | `src/front/lib/noteDraft.test.ts`                       |
+| 直列保存・競合の融合・再送上限・下書きの復帰             | `src/front/hooks/useNoteSession.test.tsx`（偽タイマー） |
+| 画面（状態表示・下書きの提案・狭い画面の読み取り専用）   | `src/front/components/NotePane/NotePane.test.tsx`       |
+| タブの切り替え                                           | `ChatArea.test.tsx`「the two tabs of the right pane」   |
+| 保存が本当に往復すること・競合の融合                     | `e2e/chatbook.spec.ts`（desktop 2 本）                  |
+
+**E2E は fixture 共有の罠を踏む。** 3 spec は同じファイルの本を使うので同じ `pdfId` を共有
+する。`chatbook.spec.ts` の `openTestBook` はハイライトと読書位置に加えて**メモも空に戻す**
+（`clearNote`）。**空にしたら本を開き直すこと**——session は入ってきた時点のメモを読み、その
+version で保存するので、リセットの前に読み込んだページは 1 回目の保存でテスト側が作った競合に
+当たる（`clearNote` が「消したかどうか」を返して `openTestBook` の reload 条件に入っているのが
+それ）。
 
 ### LLM の呼び分け
 
@@ -1240,6 +1398,8 @@ SWR の使い方で押さえるところ:
   ではない**——モジュールの 1 枠なので、テストは `rememberUploadedFile` で置き
   `forgetUploadedFile` で片付ける。SWR の既定キャッシュと同じ扱い）/
   `useChatStream(fetchFn, now)` /
+  `useNoteSession(pdfId, { loadNote, saveNote, debounceMs, storage })`（**保存先の
+  `Storage` も DI**。テストは `localStorage` ではなく手元の Map を渡す）/
   `useAskAboutSelection(addHighlight, saveSelection)` /
   `useReadingStateSync(pdfId, locationReady, save, debounceMs)`（**時間も DI**。テストは
   デバウンスを短くして偽タイマーで進める）/
@@ -1349,7 +1509,9 @@ is opened from the shelf」「an old link naming the panels no longer has a say 
 `0004_add_outline.sql` が未適用の D1 に新しいコードを載せると本を開く経路ごと 500 になる
 （列を絞って読む本棚一覧だけは生き残る。`saveReadingState` が落ちるのは、その列を実際に
 送ったときだけ——開閉の 2 つは省略なら `set` にも現れない。チャットは `outline` 列を
-select するので `0004` 未適用では 500）。
+select するので `0004` 未適用では 500）。**`0005_add_notes.sql` だけは別のテーブルなので本を
+開く経路に触らない**——未適用なら 2 本の note エンドポイントだけが 500 になり、読者にはメモタブの
+「メモを読み込めませんでした」として出る。
 ローカルは `pnpm run db:migrate:local`、リモートは
 `vp build` → `wrangler d1 migrations apply chatbook-db --remote` → `pnpm run deploy` の順。
 列の追加は旧コードに無害なので、先に当てるのが常に安全。E2E は Playwright が起動時に
@@ -1528,7 +1690,7 @@ Claude Code はエージェント用の worktree を `.claude/worktrees/` に作
 - **E2E のストアは実行のたびに作り直す**ので、前回の残骸に依存したテストは書けない。
   裏返すと、落ちた run のストアは次の run の冒頭までは残っている。中身を見たいときは
   `E2E_PERSIST_PATH=.wrangler/e2e-state vp dev` で同じストアを本棚から開く
-- **同一 run 内のハイライトと読書位置は残る**。ハイライトはテキストレイヤーの上に乗るため、
+- **同一 run 内のハイライト・読書位置・メモは残る**。ハイライトはテキストレイヤーの上に乗るため、
   先行テストの残骸があると後続の選択テストを壊す。読書位置はサーバに残るので、先行テストが
   進めたページや畳んだパネルのまま次のテストが開いてしまう（3 spec は同じ fixture ＝同じ
   `pdfId` を共有し、アップロード後の遷移先はクエリの無い `/books/<id>` ＝サーバの位置を使う
@@ -1536,7 +1698,12 @@ Claude Code はエージェント用の worktree を `.claude/worktrees/` に作
   には効かない）。各 spec が
   持つ `openTestBook`（`chatbook.spec.ts` / `tablet.spec.ts` / `mobile.spec.ts` に別々の実装が
   ある。共有していない）が開始前に selection を全削除し、読書位置をページ 1・両パネル開に
-  戻す。**畳んだ状態から始めたいテストは URL ではなくサーバへ書いてから本を開き直す**
+  戻す。**メモを空に戻すのは `chatbook.spec.ts` の `clearNote` だけ**（メモを書くテストが
+  そこにしかないため。`tablet` / `mobile` に足すならあちらの `openTestBook` にも要る）。
+  **空にしたら本を開き直すこと**——note session は入ってきた時点のメモを読み、その version で
+  保存するので、リセットより前に読み込んだページは 1 回目の保存でテスト自身が作った競合に
+  当たる（`clearNote` が「消したかどうか」を返し、`openTestBook` の reload 条件に入っている
+  のがそれ）。**畳んだ状態から始めたいテストは URL ではなくサーバへ書いてから本を開き直す**
   （`chatbook.spec.ts` の `foldChatPane` → `page.goto`。復元は本の到着ごとに 1 回だけなので、
   `openTestBook` で本を開いたあとに書いただけでは畳まれない）
 - **API が閉じているので、どのテストもまずログインする**。各 spec の `logIn` が
