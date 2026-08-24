@@ -24,6 +24,8 @@ import { bookKey } from "../../hooks/useBook";
 import type { DeleteHighlight } from "../../hooks/useHighlights";
 import type { SearchSelections } from "../../hooks/useHighlightSearch";
 import { SwrTestCache } from "../../../test/swrTestCache";
+import { stubNoteSession } from "../../../test/noteSession";
+import type { NoteSession } from "../../hooks/useNoteSession";
 
 const SELECTED_TEXT = "エッジはサーバーレス実行基盤で、実行単位をまたいでメモリを共有できません。";
 const OTHER_TEXT = "Durable Objects は単一のインスタンスに処理を集約します。";
@@ -78,6 +80,8 @@ function renderChat(
     deleteHighlight?: DeleteHighlight;
     /** Stands in for the search endpoint, which looks through the chats too. */
     searchHighlights?: SearchSelections;
+    /** The book's note, for the tests about the pane's other tab. */
+    note?: NoteSession;
   } = {},
 ) {
   const {
@@ -86,6 +90,7 @@ function renderChat(
     messages = [],
     deleteHighlight,
     searchHighlights,
+    note,
   } = options;
   const book = bookError ? undefined : BOOK;
   const store = createStore();
@@ -110,6 +115,7 @@ function renderChat(
           readQuote={() => selected}
           deleteHighlight={deleteHighlight}
           searchHighlights={searchHighlights}
+          note={note ?? stubNoteSession()}
         />
       </Provider>
     </SwrTestCache>,
@@ -369,5 +375,37 @@ describe("ChatArea", () => {
     expect(controller.signal.aborted).toBe(true);
     expect(store.get(isStreamingAtom)).toBe(false);
     expect(screen.getByText("ハイライト 2件")).toBeInTheDocument();
+  });
+
+  describe("the two tabs of the right pane", () => {
+    it("puts the note up in place of the chat, and brings the chat back", async () => {
+      renderChat({ note: stubNoteSession({ body: "# Raft\n\n選挙の話\n" }) });
+      expect(screen.getByPlaceholderText("質問を入力...")).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole("tab", { name: "メモ" }));
+
+      expect(screen.getByRole("textbox", { name: "読書メモ" })).toHaveValue("# Raft\n\n選挙の話\n");
+      expect(screen.queryByPlaceholderText("質問を入力...")).not.toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole("tab", { name: "チャット" }));
+      expect(screen.getByPlaceholderText("質問を入力...")).toBeInTheDocument();
+    });
+
+    it("offers the note beside the highlight list too, not only beside a chat", async () => {
+      // The note is about the book, so it is not something only a reader who
+      // has a conversation open can get at.
+      renderChat({ activeSelection: null, note: stubNoteSession({ body: "本についてのメモ" }) });
+
+      await userEvent.click(screen.getByRole("tab", { name: "メモ" }));
+
+      expect(screen.getByRole("textbox", { name: "読書メモ" })).toHaveValue("本についてのメモ");
+    });
+
+    it("shows no tabs at all until a book is in hand", () => {
+      // There is no note to hold until there is a book it belongs to
+      renderChat({ bookError: new Error("回線が切れました") });
+
+      expect(screen.queryByRole("tab", { name: "メモ" })).not.toBeInTheDocument();
+    });
   });
 });

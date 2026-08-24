@@ -21,6 +21,7 @@ import { useBook } from "../hooks/useBook";
 import { useIsNarrow } from "../hooks/useIsNarrow";
 import { useReadingLocation, type PassageMiss } from "../hooks/useReadingLocation";
 import { useReadingStateSync } from "../hooks/useReadingStateSync";
+import { useNoteSession } from "../hooks/useNoteSession";
 import { passageFromNavigation } from "../lib/textFragment";
 import { fetcher, resultFetcher } from "../lib/fetcher";
 import { locatedPageSchema, type LocatedPage } from "../../shared/schemas/book";
@@ -154,6 +155,12 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
     openChat,
   );
   const { saveError } = useReadingStateSync(pdfId, locationReady);
+  // Held here rather than in the pane that shows it: the note has four ways in
+  // — typing in it, a passage dropped from the page, a quick note off the
+  // toolbar, an exchange copied out of the chat — and each of them fetching and
+  // saving on its own would have this browser conflicting with itself before
+  // any second device got the chance to. One body of text, one queue.
+  const note = useNoteSession(pdfId);
 
   const handleSelectionClick = useCallback(
     (selection: ActiveSelection) => {
@@ -305,6 +312,7 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
               book={book}
               bookError={error as Error | undefined}
               onSelectionClick={handleSelectionClick}
+              note={note}
             />
           </ChatSheet>
         )}
@@ -380,6 +388,7 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
                 book={book}
                 bookError={error as Error | undefined}
                 onSelectionClick={handleSelectionClick}
+                note={note}
               />
             </div>
           </>
