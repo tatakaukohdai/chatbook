@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vite-plus/test";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vite-plus/test";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SelectionPopover } from "./SelectionPopover";
@@ -36,6 +36,20 @@ describe("SelectionPopover", () => {
   // it intervening in whichever test runs next.
   beforeEach(() => {
     window.getSelection()?.removeAllRanges();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("exposes an accessible name for the question field", () => {
+    renderPopover();
+
+    expect(screen.getByRole("textbox", { name: "選択した文章について質問" })).toHaveAttribute(
+      "placeholder",
+      "選択した文章について質問する...",
+    );
   });
 
   it("sends the typed question when Enter is pressed", async () => {
@@ -85,6 +99,33 @@ describe("SelectionPopover", () => {
     await act(async () => {
       finishAsking();
     });
+  });
+
+  it("does not ask from Enter while the same selection is being added to notes", async () => {
+    const onSubmit = vi.fn();
+    const { rerender } = render(
+      <SelectionPopover
+        quote={PASSAGE}
+        onSubmit={onSubmit}
+        onAddToNote={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+    const input = screen.getByPlaceholderText("選択した文章について質問する...");
+    await userEvent.type(input, "この段落を一言で要約して");
+    rerender(
+      <SelectionPopover
+        quote={PASSAGE}
+        onSubmit={onSubmit}
+        onAddToNote={vi.fn()}
+        addingToNote
+        onDismiss={vi.fn()}
+      />,
+    );
+
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onSubmit.mock.calls).toStrictEqual([]);
   });
 
   it("lets the reader ask again once a failed ask has finished", async () => {
@@ -199,5 +240,20 @@ describe("SelectionPopover", () => {
 
     fireEvent.mouseDown(document.body, { button: 0 });
     expect(onDismiss.mock.calls).toStrictEqual([[]]);
+  });
+
+  it("does not attach an outside-click listener after unmounting before the delay", () => {
+    vi.useFakeTimers();
+    const addEventListener = vi.spyOn(document, "addEventListener");
+    const { onDismiss, unmount } = renderPopover();
+
+    unmount();
+    act(() => {
+      vi.runAllTimers();
+    });
+    fireEvent.mouseDown(document.body, { button: 0 });
+
+    expect(onDismiss.mock.calls).toStrictEqual([]);
+    expect(addEventListener.mock.calls.filter(([type]) => type === "mousedown")).toStrictEqual([]);
   });
 });

@@ -40,6 +40,12 @@ export type SelectionHighlight = z.infer<typeof selectionHighlightSchema>;
 
 /** What the viewer sends when the reader highlights a passage. */
 export const createSelectionRequestSchema = z.object({
+  /**
+   * Stable for one UI selection operation, so replaying a request whose response
+   * was lost returns the row already stored instead of another highlight.
+   * Optional only for compatibility with an older page left open during deploy.
+   */
+  requestId: z.string().uuid().optional(),
   selectedText: z.string().min(1),
   pageNumber: z.number().int().positive(),
   positionData: positionDataSchema,

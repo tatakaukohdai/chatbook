@@ -2,15 +2,15 @@ import { describe, it, expect, afterEach, vi } from "vite-plus/test";
 import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Provider, createStore } from "jotai";
-import { errAsync, ok, okAsync, ResultAsync, type Result } from "neverthrow";
+import { err, errAsync, ok, okAsync, ResultAsync, type Result } from "neverthrow";
 import { PdfViewer, type MeasureSelection } from "./PdfViewer";
 import { SwrTestCache } from "../../../test/swrTestCache";
-import { chatSheetAtom } from "../../atoms/chatAtom";
+import { activeSelectionAtom, chatSheetAtom } from "../../atoms/chatAtom";
 import { bookKey } from "../../hooks/useBook";
 import { zoomAtomFor } from "../../atoms/settingsAtom";
 import { PHONE_WIDTH, setViewportWidth } from "../../../test/viewport";
 import { ApiError } from "../../lib/fetcher";
-import type { SaveSelection } from "../../hooks/useAskAboutSelection";
+import type { SaveSelection, SelectionDraft } from "../../hooks/useStoreSelection";
 import type { BookDetail } from "../../../shared/schemas/book";
 import type { CreatedSelection } from "../../../shared/schemas/selection";
 
@@ -35,6 +35,19 @@ function bucketWithout(body: unknown, status: number): typeof fetch {
     );
 }
 
+/** Keeps the decorative PDF load pending while allowing a question POST to finish. */
+function pendingPdfWithSuccessfulWrites(): typeof fetch {
+  return (_input, init) =>
+    init?.method === "POST"
+      ? Promise.resolve(
+          new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        )
+      : new Promise<Response>(() => {});
+}
+
 const PASSAGE = "エッジはサーバーレス実行基盤です。";
 
 /** A passage the reader has dragged over, as the real measurement reports it. */
@@ -50,6 +63,18 @@ const MEASURED: ReturnType<MeasureSelection> = {
   },
 };
 
+const NEXT_MEASURED: NonNullable<ReturnType<MeasureSelection>> = {
+  position: { x: 80, y: 180, width: 140 },
+  selectedText: "別の段落を選び直しました。",
+  selectionPosition: {
+    startIndex: 20,
+    endIndex: 32,
+    pageNumber: 1,
+    rects: [{ x: 80, y: 180, width: 140, height: 18 }],
+    pageWidth: 600,
+  },
+};
+
 const STORED: CreatedSelection = {
   id: "s1",
   selectedText: PASSAGE,
@@ -58,11 +83,21 @@ const STORED: CreatedSelection = {
   createdAt: "2026-08-01T10:00:00.000Z",
 };
 
+const NEXT_STORED: CreatedSelection = {
+  id: "s2",
+  selectedText: NEXT_MEASURED.selectedText,
+  pageNumber: NEXT_MEASURED.selectionPosition.pageNumber,
+  positionData: NEXT_MEASURED.selectionPosition,
+  createdAt: "2026-08-01T10:01:00.000Z",
+};
+
 function renderViewer(
   options: {
     measureSelection?: MeasureSelection;
     saveSelection?: SaveSelection;
     store?: ReturnType<typeof createStore>;
+    onAddSelectionToNote?: (selection: CreatedSelection) => void;
+    onPrepareSelectionQuickNote?: (draft: SelectionDraft) => void;
   } = {},
 ) {
   return render(
@@ -75,6 +110,8 @@ function renderViewer(
           onSelectionClick={() => {}}
           measureSelection={options.measureSelection}
           saveSelection={options.saveSelection}
+          onAddSelectionToNote={options.onAddSelectionToNote}
+          onPrepareSelectionQuickNote={options.onPrepareSelectionQuickNote}
         />
       </Provider>
     </SwrTestCache>,
@@ -254,12 +291,370 @@ describe("PdfViewer", () => {
       [
         BOOK.id,
         {
+          requestId: expect.any(String),
           selectedText: PASSAGE,
           pageNumber: MEASURED.selectionPosition.pageNumber,
           positionData: MEASURED.selectionPosition,
         },
       ],
     ]);
+  });
+
+  it("adds a wide-screen passage to notes only after its highlight is stored", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    let finishSaving!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const inFlight = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishSaving = resolve;
+    });
+    const addedToNote: CreatedSelection[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: () => new ResultAsync(inFlight),
+      onAddSelectionToNote: (selection) => addedToNote.push(selection),
+    });
+    const input = await selectPassage(container);
+
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    expect(screen.getByRole("button", { name: "メモに追加中..." })).toBeDisabled();
+    expect(addedToNote).toStrictEqual([]);
+
+    await act(async () => {
+      finishSaving(ok(STORED));
+    });
+
+    await waitFor(() => expect(addedToNote).toStrictEqual([STORED]));
+    expect(input).not.toBeInTheDocument();
+  });
+
+  it("keeps a newer selection when an older wide note save completes", async () => {
+    vi.stubGlobal("fetch", pendingPdfWithSuccessfulWrites());
+    let measured = MEASURED;
+    let measureCalls = 0;
+    let finishFirstSave!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const firstSave = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishFirstSave = resolve;
+    });
+    const drafts: SelectionDraft[] = [];
+    const addedToNote: CreatedSelection[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => {
+        measureCalls += 1;
+        return measured;
+      },
+      saveSelection: (_pdfId, draft) => {
+        drafts.push(draft);
+        return drafts.length === 1 ? new ResultAsync(firstSave) : okAsync(NEXT_STORED);
+      },
+      onAddSelectionToNote: (selection) => addedToNote.push(selection),
+    });
+    await selectPassage(container);
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+    measured = NEXT_MEASURED;
+    const beforeNextSelection = measureCalls;
+
+    document.dispatchEvent(new Event("selectionchange"));
+    await waitFor(() => expect(measureCalls).toBeGreaterThan(beforeNextSelection));
+    await act(async () => {
+      finishFirstSave(ok(STORED));
+    });
+
+    await waitFor(() => expect(addedToNote).toStrictEqual([STORED]));
+    expect(screen.getAllByRole("button", { name: "ハイライトのチャットを開く" })).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    await waitFor(() => expect(addedToNote).toStrictEqual([STORED, NEXT_STORED]));
+    expect(drafts).toHaveLength(2);
+    expect(drafts[1].selectedText).toBe(NEXT_MEASURED.selectedText);
+    expect(drafts[1].requestId).not.toBe(drafts[0].requestId);
+  });
+
+  it("hands a stored passage to the latest note callback after its parent rerenders", async () => {
+    // A highlight save can outlive a caret move or a layout change in the
+    // parent. The callback that was current when the click began contains the
+    // old destination, so completing through it would insert into stale state.
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    let finishSaving!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const inFlight = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishSaving = resolve;
+    });
+    const firstDestination: CreatedSelection[] = [];
+    const latestDestination: CreatedSelection[] = [];
+    const store = createStore();
+    const viewer = (onAddSelectionToNote: (selection: CreatedSelection) => void) => (
+      <SwrTestCache seed={{ [bookKey(BOOK.id)]: BOOK }}>
+        <Provider store={store}>
+          <PdfViewer
+            pdfId={BOOK.id}
+            book={BOOK}
+            bookError={undefined}
+            onSelectionClick={() => {}}
+            measureSelection={() => MEASURED}
+            saveSelection={() => new ResultAsync(inFlight)}
+            onAddSelectionToNote={onAddSelectionToNote}
+          />
+        </Provider>
+      </SwrTestCache>
+    );
+    const rendered = render(
+      viewer((selection) => {
+        firstDestination.push(selection);
+      }),
+    );
+    await selectPassage(rendered.container);
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    rendered.rerender(
+      viewer((selection) => {
+        latestDestination.push(selection);
+      }),
+    );
+    await act(async () => {
+      finishSaving(ok(STORED));
+    });
+
+    await waitFor(() => expect(latestDestination).toStrictEqual([STORED]), { timeout: 500 });
+    expect(firstDestination).toStrictEqual([]);
+  });
+
+  it("keeps the wide-screen selection UI and callback untouched when note highlighting fails", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    const addedToNote: CreatedSelection[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: () => errAsync(new ApiError("PDF not found", "PDF_NOT_FOUND", 404)),
+      onAddSelectionToNote: (selection) => addedToNote.push(selection),
+    });
+    const input = await selectPassage(container);
+
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    expect(
+      await screen.findByText("ハイライトを保存できませんでした: PDF not found"),
+    ).toBeVisible();
+    expect(input).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "メモに追加" })).toBeEnabled();
+    expect(addedToNote).toStrictEqual([]);
+  });
+
+  it("does not attach an older wide note failure to a newer selection", async () => {
+    vi.stubGlobal("fetch", pendingPdfWithSuccessfulWrites());
+    let measured = MEASURED;
+    let measureCalls = 0;
+    let finishFirstSave!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const firstSave = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishFirstSave = resolve;
+    });
+    const drafts: SelectionDraft[] = [];
+    const addedToNote: CreatedSelection[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => {
+        measureCalls += 1;
+        return measured;
+      },
+      saveSelection: (_pdfId, draft) => {
+        drafts.push(draft);
+        return drafts.length === 1 ? new ResultAsync(firstSave) : okAsync(NEXT_STORED);
+      },
+      onAddSelectionToNote: (selection) => addedToNote.push(selection),
+    });
+    await selectPassage(container);
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+    measured = NEXT_MEASURED;
+    const beforeNextSelection = measureCalls;
+
+    document.dispatchEvent(new Event("selectionchange"));
+    await waitFor(() => expect(measureCalls).toBeGreaterThan(beforeNextSelection));
+    await act(async () => {
+      finishFirstSave(err(new ApiError("first failed", "PDF_NOT_FOUND", 404)));
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText("ハイライトを保存できませんでした: first failed")).toBeNull(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    await waitFor(() => expect(addedToNote).toStrictEqual([NEXT_STORED]));
+    expect(drafts).toHaveLength(2);
+    expect(drafts[1].selectedText).toBe(NEXT_MEASURED.selectedText);
+    expect(drafts[1].requestId).not.toBe(drafts[0].requestId);
+  });
+
+  it("reuses one selection request id when a lost save response is retried", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    const drafts: SelectionDraft[] = [];
+    let attempt = 0;
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: (_pdfId, draft) => {
+        drafts.push(draft);
+        attempt += 1;
+        return attempt === 1
+          ? errAsync(new ApiError("応答を受け取れませんでした", "NETWORK_ERROR", 0, "network"))
+          : okAsync(STORED);
+      },
+      onAddSelectionToNote: () => {},
+    });
+    await selectPassage(container);
+
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+    await screen.findByText("ハイライトを保存できませんでした: 応答を受け取れませんでした");
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    expect(drafts).toHaveLength(2);
+    expect(drafts[0].requestId).toStrictEqual(expect.any(String));
+    expect(drafts[1].requestId).toBe(drafts[0].requestId);
+  });
+
+  it("stores one highlight when the wide-screen note action is clicked twice in flight", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    let finishSaving!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const inFlight = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishSaving = resolve;
+    });
+    const saved: string[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: (pdfId) => {
+        saved.push(pdfId);
+        return new ResultAsync(inFlight);
+      },
+      onAddSelectionToNote: () => {},
+    });
+    await selectPassage(container);
+
+    const add = screen.getByRole("button", { name: "メモに追加" });
+    await userEvent.dblClick(add);
+
+    expect(saved).toStrictEqual([BOOK.id]);
+
+    await act(async () => {
+      finishSaving(ok(STORED));
+    });
+  });
+
+  it("starts one save when note then question are triggered in the same event batch", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    let finishSaving!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const inFlight = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishSaving = resolve;
+    });
+    const saved: string[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: (pdfId) => {
+        saved.push(pdfId);
+        return new ResultAsync(inFlight);
+      },
+      onAddSelectionToNote: () => {},
+    });
+    const input = await selectPassage(container);
+    await userEvent.type(input, "この段落を一言で要約して");
+    const add = screen.getByRole("button", { name: "メモに追加" });
+
+    act(() => {
+      add.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+      );
+    });
+
+    expect(saved).toStrictEqual([BOOK.id]);
+    expect(input).toHaveValue("この段落を一言で要約して");
+    expect(screen.getAllByTestId("pending-selection").length).toBeGreaterThan(0);
+
+    await act(async () => {
+      finishSaving(ok(STORED));
+    });
+  });
+
+  it("starts one save when question then note are triggered in the same event batch", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    let finishSaving!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const inFlight = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishSaving = resolve;
+    });
+    const saved: string[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: (pdfId) => {
+        saved.push(pdfId);
+        return new ResultAsync(inFlight);
+      },
+      onAddSelectionToNote: () => {},
+    });
+    const input = await selectPassage(container);
+    await userEvent.type(input, "この段落を一言で要約して");
+    const add = screen.getByRole("button", { name: "メモに追加" });
+
+    act(() => {
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+      );
+      add.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(saved).toStrictEqual([BOOK.id]);
+    expect(input).toHaveValue("この段落を一言で要約して");
+    expect(screen.getAllByTestId("pending-selection").length).toBeGreaterThan(0);
+
+    await act(async () => {
+      finishSaving(ok(STORED));
+    });
+  });
+
+  it("hands a narrow-screen note action the complete draft without storing it", async () => {
+    setViewportWidth(PHONE_WIDTH);
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    const saved: string[] = [];
+    const prepared: SelectionDraft[] = [];
+    renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: (pdfId) => {
+        saved.push(pdfId);
+        return okAsync(STORED);
+      },
+      onPrepareSelectionQuickNote: (draft) => prepared.push(draft),
+    });
+    document.dispatchEvent(new Event("selectionchange"));
+
+    await userEvent.click(await screen.findByRole("button", { name: "メモに追加" }));
+
+    expect(saved).toStrictEqual([]);
+    expect(prepared).toStrictEqual([
+      {
+        requestId: expect.any(String),
+        selectedText: PASSAGE,
+        pageNumber: MEASURED.selectionPosition.pageNumber,
+        positionData: MEASURED.selectionPosition,
+      },
+    ]);
+    expect(screen.queryByRole("button", { name: "メモに追加" })).toBeNull();
+  });
+
+  it("stores a touch-wide action before handing the created selection to notes", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    const saved: string[] = [];
+    const addedToNote: CreatedSelection[] = [];
+    const prepared: SelectionDraft[] = [];
+    renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: (pdfId) => {
+        saved.push(pdfId);
+        return okAsync(STORED);
+      },
+      onAddSelectionToNote: (selection) => addedToNote.push(selection),
+      onPrepareSelectionQuickNote: (draft) => prepared.push(draft),
+    });
+    window.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "touch" }));
+    window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerType: "touch" }));
+    document.dispatchEvent(new Event("selectionchange"));
+
+    await userEvent.click(await screen.findByRole("button", { name: "メモに追加" }));
+
+    expect(saved).toStrictEqual([BOOK.id]);
+    expect(addedToNote).toStrictEqual([STORED]);
+    expect(prepared).toStrictEqual([]);
   });
 
   it("zooms the book in on a pinch, instead of letting the browser zoom the app", async () => {
@@ -319,6 +714,103 @@ describe("PdfViewer", () => {
     expect(await screen.findByText("PDFを読み込み中...")).toBeVisible();
   });
 
+  it("keeps a newer selection when an older question save completes", async () => {
+    vi.stubGlobal("fetch", pendingPdfWithSuccessfulWrites());
+    let measured = MEASURED;
+    let measureCalls = 0;
+    let finishFirstSave!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const firstSave = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishFirstSave = resolve;
+    });
+    const drafts: SelectionDraft[] = [];
+    const addedToNote: CreatedSelection[] = [];
+    const store = createStore();
+    const { container } = renderViewer({
+      measureSelection: () => {
+        measureCalls += 1;
+        return measured;
+      },
+      saveSelection: (_pdfId, draft) => {
+        drafts.push(draft);
+        return drafts.length === 1 ? new ResultAsync(firstSave) : okAsync(NEXT_STORED);
+      },
+      onAddSelectionToNote: (selection) => addedToNote.push(selection),
+      store,
+    });
+    const input = await selectPassage(container);
+    await userEvent.type(input, "この段落を一言で要約して");
+    await userEvent.click(screen.getByRole("button", { name: "質問する" }));
+    measured = NEXT_MEASURED;
+    const beforeNextSelection = measureCalls;
+
+    document.dispatchEvent(new Event("selectionchange"));
+    await waitFor(() => expect(measureCalls).toBeGreaterThan(beforeNextSelection));
+    await act(async () => {
+      finishFirstSave(ok(STORED));
+    });
+
+    await waitFor(() =>
+      expect(store.get(activeSelectionAtom)).toStrictEqual({
+        id: STORED.id,
+        selectedText: STORED.selectedText,
+        pageNumber: STORED.pageNumber,
+      }),
+    );
+    expect(screen.getAllByRole("button", { name: "ハイライトのチャットを開く" })).toHaveLength(1);
+    expect(screen.queryByText(/^ハイライトを保存できませんでした/)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    await waitFor(() => expect(addedToNote).toStrictEqual([NEXT_STORED]));
+    expect(drafts).toHaveLength(2);
+    expect(drafts[1].selectedText).toBe(NEXT_MEASURED.selectedText);
+    expect(drafts[1].requestId).not.toBe(drafts[0].requestId);
+  });
+
+  it("does not attach an older question failure to a newer selection", async () => {
+    vi.stubGlobal("fetch", pendingPdfWithSuccessfulWrites());
+    let measured = MEASURED;
+    let measureCalls = 0;
+    let finishFirstSave!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const firstSave = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishFirstSave = resolve;
+    });
+    const drafts: SelectionDraft[] = [];
+    const addedToNote: CreatedSelection[] = [];
+    const { container } = renderViewer({
+      measureSelection: () => {
+        measureCalls += 1;
+        return measured;
+      },
+      saveSelection: (_pdfId, draft) => {
+        drafts.push(draft);
+        return drafts.length === 1 ? new ResultAsync(firstSave) : okAsync(NEXT_STORED);
+      },
+      onAddSelectionToNote: (selection) => addedToNote.push(selection),
+    });
+    const input = await selectPassage(container);
+    await userEvent.type(input, "この段落を一言で要約して");
+    await userEvent.click(screen.getByRole("button", { name: "質問する" }));
+    measured = NEXT_MEASURED;
+    const beforeNextSelection = measureCalls;
+
+    document.dispatchEvent(new Event("selectionchange"));
+    await waitFor(() => expect(measureCalls).toBeGreaterThan(beforeNextSelection));
+    await act(async () => {
+      finishFirstSave(err(new ApiError("first failed", "PDF_NOT_FOUND", 404)));
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText("ハイライトを保存できませんでした: first failed")).toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "ハイライトのチャットを開く" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    await waitFor(() => expect(addedToNote).toStrictEqual([NEXT_STORED]));
+    expect(drafts).toHaveLength(2);
+    expect(drafts[1].selectedText).toBe(NEXT_MEASURED.selectedText);
+    expect(drafts[1].requestId).not.toBe(drafts[0].requestId);
+  });
+
   it("says the highlight could not be saved and keeps the question in reach", async () => {
     // The issue's symptom was the opposite: the popover closed on submit, so a
     // failed save took the typed question with it and said nothing.
@@ -339,6 +831,78 @@ describe("PdfViewer", () => {
     expect(screen.getByPlaceholderText("選択した文章について質問する...")).toHaveValue(
       "この段落を一言で要約して",
     );
+  });
+
+  it("clears a question save alert when the selection is explicitly dismissed", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: () => errAsync(new ApiError("PDF not found", "PDF_NOT_FOUND", 404)),
+    });
+    const input = await selectPassage(container);
+    await userEvent.type(input, "この段落を一言で要約して");
+    await userEvent.click(screen.getByRole("button", { name: "質問する" }));
+    await screen.findByText("ハイライトを保存できませんでした: PDF not found");
+
+    await userEvent.click(screen.getByRole("button", { name: "キャンセル" }));
+
+    expect(screen.queryByText("ハイライトを保存できませんでした: PDF not found")).toBeNull();
+  });
+
+  it("clears a question save alert when another selection settles", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    let measured = MEASURED;
+    let measureCalls = 0;
+    const { container } = renderViewer({
+      measureSelection: () => {
+        measureCalls += 1;
+        return measured;
+      },
+      saveSelection: () => errAsync(new ApiError("PDF not found", "PDF_NOT_FOUND", 404)),
+    });
+    const input = await selectPassage(container);
+    await userEvent.type(input, "この段落を一言で要約して");
+    await userEvent.click(screen.getByRole("button", { name: "質問する" }));
+    await screen.findByText("ハイライトを保存できませんでした: PDF not found");
+    measured = NEXT_MEASURED;
+    const beforeNextSelection = measureCalls;
+
+    document.dispatchEvent(new Event("selectionchange"));
+
+    await waitFor(() => expect(measureCalls).toBeGreaterThan(beforeNextSelection));
+    expect(screen.queryByText("ハイライトを保存できませんでした: PDF not found")).toBeNull();
+  });
+
+  it("clears an old question alert when the next note save starts", async () => {
+    vi.stubGlobal("fetch", bucketWithout({ ok: true }, 200));
+    let finishSaving!: (stored: Result<CreatedSelection, ApiError>) => void;
+    const inFlight = new Promise<Result<CreatedSelection, ApiError>>((resolve) => {
+      finishSaving = resolve;
+    });
+    let saves = 0;
+    const { container } = renderViewer({
+      measureSelection: () => MEASURED,
+      saveSelection: () => {
+        saves += 1;
+        return saves === 1
+          ? errAsync(new ApiError("PDF not found", "PDF_NOT_FOUND", 404))
+          : new ResultAsync(inFlight);
+      },
+      onAddSelectionToNote: () => {},
+    });
+    const input = await selectPassage(container);
+    await userEvent.type(input, "この段落を一言で要約して");
+    await userEvent.click(screen.getByRole("button", { name: "質問する" }));
+    await screen.findByText("ハイライトを保存できませんでした: PDF not found");
+
+    await userEvent.click(screen.getByRole("button", { name: "メモに追加" }));
+
+    expect(screen.queryByText("ハイライトを保存できませんでした: PDF not found")).toBeNull();
+    expect(screen.getByRole("button", { name: "メモに追加中..." })).toBeDisabled();
+
+    await act(async () => {
+      finishSaving(ok(STORED));
+    });
   });
 
   it("closes the popover once the highlight is stored", async () => {

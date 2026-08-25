@@ -1,7 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { FIXTURE_FILE_NAME, PAGE_COUNT } from "./fixtures/testBookManifest.ts";
+import { COVER_TITLE, FIXTURE_FILE_NAME, PAGE_COUNT } from "./fixtures/testBookManifest.ts";
 
 /**
  * The reader on a screen wide enough for two panes, touched rather than
@@ -15,9 +15,10 @@ import { FIXTURE_FILE_NAME, PAGE_COUNT } from "./fixtures/testBookManifest.ts";
  *
  * Not covered here: the long press itself. Playwright drives `tap` and nothing
  * more — the platform's own selection gesture cannot be synthesised
- * (`docs/PDF_TEXT_SELECTION.md` §8). The selection below is made with the mouse,
- * which still proves what changed: that it is picked up by settling rather than
- * by a button coming up, at this width.
+ * (`docs/PDF_TEXT_SELECTION.md` §8). The selection below pairs a real touch with
+ * the DOM Range that the platform's long press would have produced. This proves
+ * that a touch-settled selection is picked up without a mouse button coming up
+ * at this width.
  */
 
 const TEST_PDF = path.join(
@@ -35,6 +36,21 @@ async function logIn(page: Page): Promise<void> {
     data: { username: "demo", password: "demo" },
   });
   expect(response.status()).toBe(200);
+}
+
+/** Reset the note shared by desktop, mobile, and tablet fixture uploads. */
+async function clearNote(page: Page, pdfId: string): Promise<boolean> {
+  const note = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    body: string;
+    version: number;
+  };
+  if (note.body === "") return false;
+
+  const response = await page.request.put(`/api/pdf/${pdfId}/note`, {
+    data: { body: "", version: note.version },
+  });
+  expect(response.status()).toBe(200);
+  return true;
 }
 
 async function openTestBook(page: Page): Promise<string> {
@@ -65,6 +81,7 @@ async function openTestBook(page: Page): Promise<string> {
   await page.request.put(`/api/pdf/${pdfId}/reading-state`, {
     data: { page: 1, selectionId: null, outlineOpen: true, chatPanelOpen: true },
   });
+  const noteWasWrittenIn = await clearNote(page, pdfId);
 
   // Reload only where the reader is showing something the reset has just
   // replaced: a second load of the book costs as much as the first one.
@@ -73,13 +90,16 @@ async function openTestBook(page: Page): Promise<string> {
     (readingState.page !== 1 ||
       readingState.outlineOpen === false ||
       readingState.chatPanelOpen === false);
-  if (selections.length > 0 || resumedElsewhere) {
+  if (selections.length > 0 || resumedElsewhere || noteWasWrittenIn) {
     await page.goto(`/books/${pdfId}?page=1`);
   }
   // The page counter arrives with the book, but a tap or a drag needs the page
   // itself to have been drawn.
   await expect(page.getByText(pageLabel(1), { exact: true })).toBeVisible({ timeout: 60000 });
   await expect(page.locator("canvas.block")).toBeVisible({ timeout: 60000 });
+  await expect(page.locator('.textLayer span[data-page-number="1"]').first()).toBeVisible({
+    timeout: 60000,
+  });
   return pdfId;
 }
 
@@ -165,6 +185,62 @@ test("opens the question box on a finger only once it is asked for", async ({ pa
   await expect(page.getByPlaceholder("選択した文章について質問する...")).toBeVisible();
 });
 
+test("adds a passage chosen by a finger to the wide note editor", async ({ page }) => {
+  const pdfId = await openTestBook(page);
+  await pickPassageWithAFinger(page);
+
+  const selected = await page.evaluate(() => window.getSelection()?.toString() ?? "");
+  expect(selected).toBe(COVER_TITLE);
+  const dismiss = page.getByRole("button", { name: "選択をやめる" });
+  await expect(dismiss).toBeVisible({ timeout: 10000 });
+  const actionBar = dismiss.locator("..");
+  const add = actionBar.getByRole("button", { name: "メモに追加" });
+  await expect(add).toBeVisible({ timeout: 10000 });
+  await expect(actionBar.locator("textarea")).toHaveCount(0);
+  await expect(page.getByPlaceholder("選択した文章について質問する...")).toHaveCount(0);
+
+  const selectionSaved = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/pdf/${pdfId}/selections`) &&
+      response.request().method() === "POST" &&
+      response.ok(),
+  );
+  const noteSaved = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/pdf/${pdfId}/note`) &&
+      response.request().method() === "PUT" &&
+      response.request().postData()?.includes(COVER_TITLE) === true &&
+      response.ok(),
+  );
+  await add.tap();
+
+  const selectionResponse = await selectionSaved;
+  await noteSaved;
+  const created = (await selectionResponse.json()) as {
+    id: string;
+    selectedText: string;
+    pageNumber: number;
+  };
+  expect(created.selectedText).toBe(COVER_TITLE);
+  expect(created.pageNumber).toBe(1);
+
+  await expect(page.getByRole("tab", { name: "メモ" })).toHaveAttribute("aria-selected", "true");
+  const editor = page.getByRole("textbox", { name: "読書メモ" });
+  await expect(editor).toBeVisible();
+  expect(await editor.evaluate((node) => node.tagName)).toBe("TEXTAREA");
+  await expect(page.getByRole("textbox", { name: "クイックメモ" })).toHaveCount(0);
+  await expect(editor).toHaveValue(
+    `> ${COVER_TITLE}\n\n<sup>[p.1](?page=1&selection=${created.id})</sup>`,
+  );
+  await expect(page.getByText("保存済み", { exact: true })).toBeVisible();
+
+  const note = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    body: string;
+  };
+  expect(note.body).toContain(`> ${COVER_TITLE}`);
+  expect(note.body).toContain(`?page=1&selection=${created.id}`);
+});
+
 test("turns the page on a tap at the edge, and leaves the middle alone", async ({ page }) => {
   await openTestBook(page);
   const pane = (await pagePane(page).boundingBox())!;
@@ -180,10 +256,12 @@ test("turns the page on a tap at the edge, and leaves the middle alone", async (
   await page.touchscreen.tap(pane.x + pane.width * 0.5, middleY);
   await expect(page.getByText(pageLabel(1), { exact: true })).toBeVisible();
 
-  // Asserting page 1 straight after the middle tap would pass whether the tap
-  // was ignored or had not been acted on yet. Turning the page from here says
-  // which: a middle tap that had counted would land on 3 instead.
-  await page.touchscreen.tap(pane.x + pane.width * 0.9, middleY);
+  // Asserting page 1 straight after the middle tap could pass before a queued
+  // state change renders. Move from the semantic control instead: if the
+  // middle had counted as a page turn, this would land on 3 rather than 2.
+  // This also avoids asking headless Chromium for a fifth rapid synthetic
+  // touch after it dropped a touchend while the previous page DOM was swapped.
+  await page.getByRole("button", { name: "次のページ" }).tap();
   await expect(page.getByText(pageLabel(2), { exact: true })).toBeVisible();
 });
 

@@ -10,6 +10,12 @@ import {
   type SaveNoteFailure,
 } from "../lib/noteApi";
 import { clearDraft, readDraft, writeDraft } from "../lib/noteDraft";
+import {
+  appendQuickNote,
+  insertNoteMarkdown,
+  type NoteInsertion,
+  type TextRange,
+} from "../lib/noteInsertion";
 import { hasConflictMarkers, mergeNoteBodies } from "../lib/noteMerge";
 
 /**
@@ -52,6 +58,23 @@ interface SessionState {
   saveError: string | null;
 }
 
+/** A position-independent append kept until the server confirms it. */
+interface QuickAppendIntent {
+  /** The complete entry, including any selection id already created upstream. */
+  entry: string;
+  /** Body to which the canonical entry delta in `attemptBody` was applied. */
+  attemptBaseBody: string;
+  /** Base used only to carry concurrent free editing onto the next server body. */
+  mergeBaseBody: string;
+  /** Exact body sent by the next PUT. */
+  attemptBody: string;
+  conflicts: number;
+  /** A failed intent moves only when its dedicated retry is invoked. */
+  awaitingRetry: boolean;
+  promise: Promise<boolean> | null;
+  settle: ((saved: boolean) => void) | null;
+}
+
 export interface NoteSession {
   body: string;
   status: NoteStatus;
@@ -65,6 +88,14 @@ export interface NoteSession {
   draftOffer: string | null;
   /** The reader typed. */
   edit: (body: string) => void;
+  /** Insert Markdown into the current local body and return the next caret. */
+  insert: (markdown: string, range?: TextRange) => NoteInsertion;
+  /** Append one complete quick-note entry, keeping it until it is saved. */
+  appendQuick: (entry: string) => Promise<boolean>;
+  /** Retry the same complete quick-note entry without rebuilding it upstream. */
+  retryQuickAppend: () => Promise<boolean>;
+  quickAppendError: string | null;
+  quickAppending: boolean;
   /** Save now, rather than waiting out the debounce. */
   save: () => void;
   /** Take the draft up, merging it onto the server's note if that has moved. */
@@ -83,6 +114,50 @@ const LOADING: SessionState = {
 
 const CONFLICT_MESSAGE = "別の端末の変更と重なりました。マーカーの箇所を直すと保存を再開します";
 const RETRIES_SPENT = "別の端末が書き込み続けているため保存を中断しました。「保存」で書き込めます";
+
+/**
+ * Whether the one canonical insertion made by an attempt is already durable.
+ *
+ * `appendQuickNote` changes one contiguous region. Keeping the exact base of
+ * each PUT lets us isolate that addition even when the server's 409 body has
+ * further changes and therefore no longer equals the attempted body. Counting
+ * relative to the attempt base also handles a reader intentionally entering
+ * the same quick text more than once: only the additional occurrence proves
+ * this intent landed.
+ */
+function hasDurableQuickDelta(base: string, attempt: string, current: string): boolean {
+  let prefix = 0;
+  const sharedLength = Math.min(base.length, attempt.length);
+  while (prefix < sharedLength && base[prefix] === attempt[prefix]) prefix += 1;
+
+  let suffix = 0;
+  const baseRemainder = base.length - prefix;
+  const attemptRemainder = attempt.length - prefix;
+  while (
+    suffix < baseRemainder &&
+    suffix < attemptRemainder &&
+    base[base.length - suffix - 1] === attempt[attempt.length - suffix - 1]
+  ) {
+    suffix += 1;
+  }
+
+  const addition = attempt.slice(prefix, attempt.length - suffix);
+  if (addition === "") return false;
+
+  return countOccurrences(current, addition) > countOccurrences(base, addition);
+}
+
+function countOccurrences(body: string, text: string): number {
+  let count = 0;
+  let from = 0;
+  while (from <= body.length - text.length) {
+    const found = body.indexOf(text, from);
+    if (found === -1) break;
+    count += 1;
+    from = found + text.length;
+  }
+  return count;
+}
 
 /** Cache key of a book's note. */
 export const noteKey = (pdfId: string) => `/api/pdf/${pdfId}/note`;
@@ -134,6 +209,8 @@ export function useNoteSession(
   const [state, setState] = useState<SessionState>(LOADING);
   const [draftOffer, setDraftOffer] = useState<string | null>(null);
   const [draftError, setDraftError] = useState<string | null>(null);
+  const [quickAppendError, setQuickAppendError] = useState<string | null>(null);
+  const [quickAppending, setQuickAppending] = useState(false);
 
   const isNarrow = useIsNarrow();
 
@@ -141,6 +218,7 @@ export function useNoteSession(
   const stateRef = useRef(state);
   const savingRef = useRef(false);
   const conflictsRef = useRef(0);
+  const quickIntentRef = useRef<QuickAppendIntent | null>(null);
   const offerRef = useRef(draftOffer);
   const narrowRef = useRef(isNarrow);
   narrowRef.current = isNarrow;
@@ -241,6 +319,28 @@ export function useNoteSession(
     return next === base ? "saved" : "dirty";
   }, []);
 
+  const waitForQuickIntent = useCallback((intent: QuickAppendIntent): Promise<boolean> => {
+    if (intent.promise) return intent.promise;
+
+    intent.promise = new Promise<boolean>((resolve) => {
+      intent.settle = resolve;
+    });
+    return intent.promise;
+  }, []);
+
+  const finishQuickAttempt = useCallback(
+    (intent: QuickAppendIntent, saved: boolean, error: string | null) => {
+      intent.awaitingRetry = !saved;
+      setQuickAppending(false);
+      setQuickAppendError(error);
+      intent.settle?.(saved);
+      intent.settle = null;
+      intent.promise = null;
+      if (saved && quickIntentRef.current === intent) quickIntentRef.current = null;
+    },
+    [],
+  );
+
   const onSaved = useCallback(
     (snapshot: string, version: number) => {
       conflictsRef.current = 0;
@@ -288,6 +388,91 @@ export function useNoteSession(
     [commit],
   );
 
+  const onQuickSaved = useCallback(
+    (intent: QuickAppendIntent, snapshot: string, version: number) => {
+      if (quickIntentRef.current !== intent) return;
+
+      conflictsRef.current = 0;
+      const now = stateRef.current;
+      commit({
+        baseBody: snapshot,
+        baseVersion: version,
+        body: now.body,
+        status: statusFor(now.body, snapshot),
+        saveError: null,
+      });
+      finishQuickAttempt(intent, true, null);
+    },
+    [commit, finishQuickAttempt, statusFor],
+  );
+
+  const onDurableQuickAttempt = useCallback(
+    (intent: QuickAppendIntent, current: { body: string; version: number }) => {
+      if (quickIntentRef.current !== intent) return;
+
+      conflictsRef.current = 0;
+      const now = stateRef.current;
+      // The quick PUT is already durable. Carry only editing made after that
+      // attempt onto the newer server body; the canonical entry is present on
+      // both sides, so it cannot be appended a second time here.
+      const rebased = mergeNoteBodies(now.body, intent.attemptBody, current.body);
+      commit({
+        baseBody: current.body,
+        baseVersion: current.version,
+        body: rebased.body,
+        status: rebased.conflicted ? "conflicted" : statusFor(rebased.body, current.body),
+        saveError: rebased.conflicted ? CONFLICT_MESSAGE : null,
+      });
+      finishQuickAttempt(intent, true, null);
+    },
+    [commit, finishQuickAttempt, statusFor],
+  );
+
+  const onQuickRefused = useCallback(
+    (intent: QuickAppendIntent, failure: SaveNoteFailure, countAttempt = true) => {
+      if (quickIntentRef.current !== intent) return;
+      const now = stateRef.current;
+
+      if (failure.type === "API") {
+        commit({ ...now, status: "failed", saveError: null });
+        finishQuickAttempt(intent, false, failure.cause.message);
+        return;
+      }
+
+      // The server may have accepted the PUT even though only its response was
+      // lost. Compare the canonical delta from the base of that exact attempt,
+      // rather than only the whole body: another device may already have added
+      // more text before the retry returns its 409.
+      if (hasDurableQuickDelta(intent.attemptBaseBody, intent.attemptBody, failure.current.body)) {
+        onDurableQuickAttempt(intent, failure.current);
+        return;
+      }
+
+      if (countAttempt) intent.conflicts += 1;
+      const nextAttempt = appendQuickNote(failure.current.body, intent.entry);
+      // The quick entry itself is rebased without positions. The merge is only
+      // for free editing that was already local, or arrived while the PUT was
+      // out; it must remain on screen and flow through the ordinary queue.
+      const rebased = mergeNoteBodies(now.body, intent.mergeBaseBody, nextAttempt);
+      intent.attemptBaseBody = failure.current.body;
+      intent.mergeBaseBody = nextAttempt;
+      intent.attemptBody = nextAttempt;
+
+      const spent = intent.conflicts >= MAX_CONFLICT_RETRIES;
+      const error = rebased.conflicted ? CONFLICT_MESSAGE : spent ? RETRIES_SPENT : null;
+      commit({
+        baseBody: failure.current.body,
+        baseVersion: failure.current.version,
+        body: rebased.body,
+        status: rebased.conflicted || spent ? "conflicted" : "dirty",
+        saveError: rebased.conflicted ? CONFLICT_MESSAGE : null,
+      });
+
+      if (error) finishQuickAttempt(intent, false, error);
+    },
+    [commit, finishQuickAttempt, onDurableQuickAttempt],
+  );
+
   const runSave = useCallback(() => {
     const book = pdfId;
     if (!book) return;
@@ -299,19 +484,58 @@ export function useNoteSession(
     // browser. Whatever is still unsaved goes out once this answer is in.
     if (savingRef.current) return;
 
-    const snapshot = now.body;
+    const quickIntent = quickIntentRef.current;
+    // A failed quick append owns the current save snapshot until the reader
+    // explicitly retries it. Debounce, generic save, resize, and marker edits
+    // must not silently turn that failure into another attempt.
+    if (quickIntent?.awaitingRetry) return;
+    let snapshot = quickIntent?.attemptBody ?? now.body;
+    if (hasConflictMarkers(snapshot)) {
+      // A quick entry created while free editing was conflicted keeps that
+      // first marker-bearing attempt for retry. Once the reader resolves the
+      // screen body, it is already carrying the entry exactly once, so that
+      // complete body replaces the stale attempt without appending again.
+      if (!quickIntent || hasConflictMarkers(now.body)) return;
+      quickIntent.attemptBaseBody = now.baseBody;
+      quickIntent.attemptBody = now.body;
+      snapshot = now.body;
+    }
     savingRef.current = true;
     update({ ...now, status: "saving" });
 
-    void saveNote(book, { body: snapshot, version: now.baseVersion })
-      .match(
-        ({ version }) => onSaved(snapshot, version),
-        (failure) => onRefused(failure),
-      )
-      .finally(() => {
+    void saveNote(book, { body: snapshot, version: now.baseVersion }).match(
+      ({ version }) => {
         savingRef.current = false;
-      });
-  }, [onRefused, onSaved, pdfId, saveNote, update]);
+        if (quickIntent) {
+          onQuickSaved(quickIntent, snapshot, version);
+          return;
+        }
+
+        const queuedQuick = quickIntentRef.current;
+        if (queuedQuick) {
+          queuedQuick.mergeBaseBody = appendQuickNote(snapshot, queuedQuick.entry);
+        }
+        onSaved(snapshot, version);
+      },
+      (failure) => {
+        savingRef.current = false;
+        if (quickIntent) {
+          onQuickRefused(quickIntent, failure);
+          return;
+        }
+
+        const queuedQuick = quickIntentRef.current;
+        if (queuedQuick) {
+          // The request began before the quick append was queued. Its 409
+          // still supplies the current server body needed to rebase that
+          // intent, but does not count as one of the intent's own attempts.
+          onQuickRefused(queuedQuick, failure, false);
+          return;
+        }
+        onRefused(failure);
+      },
+    );
+  }, [onQuickRefused, onQuickSaved, onRefused, onSaved, pdfId, saveNote, update]);
 
   // The wait a keystroke resets, and the queue behind a save that has just
   // answered: any move of the session re-reads the state and, if something is
@@ -334,6 +558,86 @@ export function useNoteSession(
     },
     [commit, statusFor],
   );
+
+  const insert = useCallback(
+    (markdown: string, range?: TextRange): NoteInsertion => {
+      const now = stateRef.current;
+      const insertion = insertNoteMarkdown(now.body, markdown, range);
+      if (now.status === "loading") return insertion;
+
+      commit({
+        ...now,
+        body: insertion.body,
+        status: statusFor(insertion.body, now.baseBody),
+        saveError: null,
+      });
+      return insertion;
+    },
+    [commit, statusFor],
+  );
+
+  const appendQuick = useCallback(
+    (entry: string): Promise<boolean> => {
+      const existing = quickIntentRef.current;
+      if (existing) return existing.promise ?? Promise.resolve(false);
+
+      const now = stateRef.current;
+      if (!pdfId || now.status === "loading") return Promise.resolve(false);
+
+      const attemptBody = appendQuickNote(now.body, entry);
+      const intent: QuickAppendIntent = {
+        entry,
+        attemptBaseBody: now.body,
+        // Put the same position-independent entry on both sides of the merge.
+        // Differences found later are then only the reader's free editing,
+        // never the quick entry itself.
+        mergeBaseBody: appendQuickNote(now.baseBody, entry),
+        attemptBody,
+        conflicts: 0,
+        awaitingRetry: false,
+        promise: null,
+        settle: null,
+      };
+      quickIntentRef.current = intent;
+      const completion = waitForQuickIntent(intent);
+      setQuickAppendError(null);
+      setQuickAppending(true);
+      commit({
+        ...now,
+        body: attemptBody,
+        status: statusFor(attemptBody, now.baseBody),
+        saveError: null,
+      });
+      if (hasConflictMarkers(attemptBody)) {
+        finishQuickAttempt(intent, false, CONFLICT_MESSAGE);
+        return completion;
+      }
+      runSave();
+      return completion;
+    },
+    [commit, finishQuickAttempt, pdfId, runSave, statusFor, waitForQuickIntent],
+  );
+
+  const retryQuickAppend = useCallback((): Promise<boolean> => {
+    const intent = quickIntentRef.current;
+    if (!intent) return Promise.resolve(false);
+    if (intent.promise) return intent.promise;
+
+    if (hasConflictMarkers(stateRef.current.body)) {
+      setQuickAppendError(CONFLICT_MESSAGE);
+      return Promise.resolve(false);
+    }
+
+    intent.conflicts = 0;
+    intent.awaitingRetry = false;
+    const completion = waitForQuickIntent(intent);
+    setQuickAppendError(null);
+    setQuickAppending(true);
+    const now = stateRef.current;
+    commit({ ...now, status: "dirty", saveError: null });
+    runSave();
+    return completion;
+  }, [commit, runSave, waitForQuickIntent]);
 
   const recoverDraft = useCallback(() => {
     const draft = draftRef.current;
@@ -373,6 +677,11 @@ export function useNoteSession(
     draftError,
     draftOffer,
     edit,
+    insert,
+    appendQuick,
+    retryQuickAppend,
+    quickAppendError,
+    quickAppending,
     save: runSave,
     recoverDraft,
     discardDraft,

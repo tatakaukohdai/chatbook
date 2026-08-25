@@ -1036,6 +1036,60 @@ describe("POST /api/pdf/:pdfId/selections", () => {
       },
     ]);
   });
+
+  it("returns the same highlight when a stored selection request is replayed", async () => {
+    const book = await uploadBook({ tag: "sel-idempotent", fileName: "sel-idempotent.pdf" });
+    const request = {
+      requestId: "7e0055d7-5bc3-40af-bab4-4db62a9f8ef9",
+      selectedText: "応答だけが失われた選択",
+      pageNumber: 2,
+      positionData: {
+        rects: [{ x: 40, y: 40, width: 160, height: 24 }],
+        pageWidth: 600,
+      },
+    };
+
+    const first = await postSelection(book.id, request);
+    expect(first.status).toBe(201);
+    const created = await first.json();
+
+    // The first response can disappear after D1 has committed. Replaying the
+    // same operation must recover that row, not create a second highlight.
+    const replay = await postSelection(book.id, request);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toStrictEqual(created);
+    expect(await readSelections(book.id)).toHaveLength(1);
+  });
+
+  it("refuses an idempotency id reused for a different selection", async () => {
+    const book = await uploadBook({ tag: "sel-id-collision", fileName: "sel-id-collision.pdf" });
+    const requestId = "b84f5b24-e8f8-4cf0-8f91-856222b9db6c";
+    const first = await postSelection(book.id, {
+      requestId,
+      selectedText: "最初の選択",
+      pageNumber: 1,
+      positionData: { rects: [] },
+    });
+    expect(first.status).toBe(201);
+
+    const collision = await postSelection(book.id, {
+      requestId,
+      selectedText: "同じIDを誤用した別の選択",
+      pageNumber: 2,
+      positionData: { rects: [] },
+    });
+
+    expect(collision.status).toBe(409);
+    expect(await collision.json()).toStrictEqual({
+      error: {
+        code: "SELECTION_REQUEST_CONFLICT",
+        message: "Selection request id is already in use",
+      },
+    });
+    const stored = await readSelections(book.id);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ id: requestId, selectedText: "最初の選択", pageNumber: 1 });
+  });
 });
 
 describe("DELETE /api/pdf/:pdfId/selections/:selId", () => {

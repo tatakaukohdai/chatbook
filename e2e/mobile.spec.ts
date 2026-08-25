@@ -1,7 +1,12 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { FIXTURE_FILE_NAME, OUTLINE, PAGE_COUNT } from "./fixtures/testBookManifest.ts";
+import {
+  COVER_TITLE,
+  FIXTURE_FILE_NAME,
+  OUTLINE,
+  PAGE_COUNT,
+} from "./fixtures/testBookManifest.ts";
 
 /**
  * The reader on a screen with room for one column.
@@ -40,6 +45,27 @@ async function logIn(page: Page): Promise<void> {
   expect(response.status()).toBe(200);
 }
 
+/**
+ * Empty the shared fixture's note with the version the server just returned.
+ *
+ * All three projects upload the same bytes and therefore use the same pdf id.
+ * Returning whether anything changed lets the caller reload only when the
+ * already-mounted note session has become stale because of this reset.
+ */
+async function clearNote(page: Page, pdfId: string): Promise<boolean> {
+  const note = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    body: string;
+    version: number;
+  };
+  if (note.body === "") return false;
+
+  const response = await page.request.put(`/api/pdf/${pdfId}/note`, {
+    data: { body: "", version: note.version },
+  });
+  expect(response.status()).toBe(200);
+  return true;
+}
+
 async function openTestBook(page: Page): Promise<string> {
   await logIn(page);
   await page.goto("/");
@@ -68,6 +94,7 @@ async function openTestBook(page: Page): Promise<string> {
   await page.request.put(`/api/pdf/${pdfId}/reading-state`, {
     data: { page: 1, selectionId: null, outlineOpen: true, chatPanelOpen: true },
   });
+  const noteWasWrittenIn = await clearNote(page, pdfId);
 
   // Reload only where the reader is showing something the reset has just
   // replaced: a second load of the book costs as much as the first one.
@@ -76,14 +103,28 @@ async function openTestBook(page: Page): Promise<string> {
     (readingState.page !== 1 ||
       readingState.outlineOpen === false ||
       readingState.chatPanelOpen === false);
-  if (selections.length > 0 || resumedElsewhere) {
+  if (selections.length > 0 || resumedElsewhere || noteWasWrittenIn) {
     await page.goto(`/books/${pdfId}?page=1`);
   }
   // The page counter arrives with the book, but a tap or a drag needs the page
   // itself to have been drawn.
   await expect(page.getByText(pageLabel(1), { exact: true })).toBeVisible({ timeout: 60000 });
   await expect(page.locator("canvas.block")).toBeVisible({ timeout: 60000 });
+  await expect(page.locator('.textLayer span[data-page-number="1"]').first()).toBeVisible({
+    timeout: 60000,
+  });
   return pdfId;
+}
+
+/** Drag a known fixture line with the browser's real selection behavior. */
+async function dragPassage(page: Page, line: Locator): Promise<string> {
+  const box = (await line.boundingBox())!;
+  await page.mouse.move(box.x + 1, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width - 1, box.y + box.height / 2, { steps: 12 });
+  const selected = await page.evaluate(() => window.getSelection()?.toString() ?? "");
+  await page.mouse.up();
+  return selected;
 }
 
 /** The pane the page is drawn and scrolled in. */
@@ -200,6 +241,101 @@ test("offers to ask about a passage, and puts the question box up on request", a
   await expect(page.getByPlaceholder("選択した文章について質問する...")).toHaveCount(0);
   await ask.tap();
   await expect(page.getByPlaceholder("選択した文章について質問する...")).toBeVisible();
+});
+
+test("adds plain and selected quick notes without exposing the wide editor", async ({ page }) => {
+  const pdfId = await openTestBook(page);
+
+  await page.getByRole("button", { name: "チャット" }).tap();
+  await page.getByRole("tab", { name: "メモ" }).tap();
+
+  const noteSheet = page.getByRole("region", { name: "チャット" });
+  await expect(noteSheet).toBeVisible();
+  const quickInput = page.getByRole("textbox", { name: "クイックメモ" });
+  await expect(quickInput).toBeVisible();
+  expect(await quickInput.evaluate((node) => node.tagName)).toBe("INPUT");
+  await expect(noteSheet.locator("textarea")).toHaveCount(0);
+  await expect(page.getByRole("textbox", { name: "読書メモ" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "太字" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "見出し" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "リスト" })).toHaveCount(0);
+
+  const plainMemo = "選択なしのクイックメモ";
+  await quickInput.fill(plainMemo);
+  const plainSave = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/pdf/${pdfId}/note`) &&
+      response.request().method() === "PUT" &&
+      response.request().postData()?.includes(plainMemo) === true &&
+      response.ok(),
+  );
+  await page.getByRole("button", { name: "メモを追加" }).tap();
+  await plainSave;
+  await expect(page.getByText(plainMemo, { exact: true })).toBeVisible();
+  await expect(page.getByText("保存済み", { exact: true })).toBeVisible();
+
+  const afterPlain = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    body: string;
+  };
+  expect(afterPlain.body).toContain(plainMemo);
+
+  await page.getByRole("button", { name: "チャットを閉じる" }).tap();
+  await expect(page.getByRole("region", { name: "チャット" })).toHaveCount(0);
+
+  const selected = await dragPassage(page, page.locator(".textLayer span").first());
+  expect(selected).toBe(COVER_TITLE);
+  const addSelection = page.getByRole("button", { name: "メモに追加" });
+  await expect(addSelection).toBeVisible({ timeout: 10000 });
+  await addSelection.tap();
+
+  await expect(noteSheet).toBeVisible();
+  await expect(page.getByRole("tab", { name: "メモ" })).toHaveAttribute("aria-selected", "true");
+  await expect(noteSheet.getByText(COVER_TITLE, { exact: true })).toBeVisible();
+
+  const comment = "あとで本文と照合する";
+  await quickInput.fill(comment);
+  const selectionSaved = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/pdf/${pdfId}/selections`) &&
+      response.request().method() === "POST" &&
+      response.ok(),
+  );
+  const selectedNoteSaved = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/pdf/${pdfId}/note`) &&
+      response.request().method() === "PUT" &&
+      response.request().postData()?.includes(comment) === true &&
+      response.ok(),
+  );
+  await page.getByRole("button", { name: "メモを追加" }).tap();
+
+  const selectionResponse = await selectionSaved;
+  await selectedNoteSaved;
+  const created = (await selectionResponse.json()) as {
+    id: string;
+    selectedText: string;
+    pageNumber: number;
+  };
+  expect(created.selectedText).toBe(COVER_TITLE);
+  expect(created.pageNumber).toBe(1);
+  expect(created.id).not.toBe("");
+
+  await expect(page.getByText(comment, { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "p.1" })).toBeVisible();
+  await expect(page.getByText("保存済み", { exact: true })).toBeVisible();
+
+  const book = (await (await page.request.get(`/api/pdf/${pdfId}`)).json()) as {
+    selections: Array<{ id: string; selectedText: string; pageNumber: number }>;
+  };
+  expect(book.selections).toEqual([
+    expect.objectContaining({ id: created.id, selectedText: COVER_TITLE, pageNumber: 1 }),
+  ]);
+  const durableNote = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    body: string;
+  };
+  expect(durableNote.body).toContain(`> ${COVER_TITLE}`);
+  expect(durableNote.body).toContain(comment);
+  expect(durableNote.body).toContain(`?page=1&selection=${created.id}`);
 });
 
 test("keeps the shelf shut until the password is typed", async ({ page }) => {

@@ -22,10 +22,20 @@ import { useIsNarrow } from "../hooks/useIsNarrow";
 import { useReadingLocation, type PassageMiss } from "../hooks/useReadingLocation";
 import { useReadingStateSync } from "../hooks/useReadingStateSync";
 import { useNoteSession } from "../hooks/useNoteSession";
+import { useHighlights } from "../hooks/useHighlights";
+import {
+  useStoreSelection,
+  type SaveSelection,
+  type SelectionDraft,
+} from "../hooks/useStoreSelection";
 import { passageFromNavigation } from "../lib/textFragment";
+import { formatSelectionNote, type TextRange } from "../lib/noteInsertion";
 import { fetcher, resultFetcher } from "../lib/fetcher";
 import { locatedPageSchema, type LocatedPage } from "../../shared/schemas/book";
 import { chatHistorySchema } from "../../shared/schemas/chat";
+import type { CreatedSelection } from "../../shared/schemas/selection";
+import { rightPaneTabAtom } from "../atoms/noteAtom";
+import type { MeasureSelection } from "../components/PdfViewer/PdfViewer";
 
 /**
  * How wide the handle between the panes is, in pixels.
@@ -64,17 +74,35 @@ const PASSAGE_MISS_MESSAGE: Record<PassageMiss, string> = {
  * rendering once with whatever was missed. The book itself survives the swap:
  * it lives in the SWR cache, which is outside the store.
  */
-export function AppPage() {
+export interface AppPageProps {
+  /** PdfViewer integration seams used by jsdom; route use leaves both real. */
+  measureSelection?: MeasureSelection;
+  saveSelection?: SaveSelection;
+}
+
+export function AppPage({ measureSelection, saveSelection }: AppPageProps = {}) {
   const { pdfId } = useParams();
 
   return (
     <Provider key={pdfId}>
-      <BookReader pdfId={pdfId} />
+      <BookReader pdfId={pdfId} measureSelection={measureSelection} saveSelection={saveSelection} />
     </Provider>
   );
 }
 
-function BookReader({ pdfId }: { pdfId: string | undefined }) {
+type PendingQuickSelection =
+  | { kind: "draft"; draft: SelectionDraft }
+  | { kind: "stored"; draft: SelectionDraft; selection: CreatedSelection };
+
+function BookReader({
+  pdfId,
+  measureSelection,
+  saveSelection,
+}: {
+  pdfId: string | undefined;
+  measureSelection?: MeasureSelection;
+  saveSelection?: SaveSelection;
+}) {
   const { data: book, error } = useBook(pdfId);
   const [, setActiveSelection] = useAtom(activeSelectionAtom);
   const [, setChatMessages] = useAtom(chatMessagesAtom);
@@ -85,11 +113,20 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
   const [chatMaximized, setChatMaximized] = useAtom(chatMaximizedAtom);
   const [outlineOpen, setOutlineOpen] = useAtom(outlineOpenAtom);
   const [chatSheet, setChatSheet] = useAtom(chatSheetAtom);
+  const setRightPaneTab = useSetAtom(rightPaneTabAtom);
   const abortChatStream = useSetAtom(abortChatStreamAtom);
   const [leftWidth, setLeftWidth] = useState(60);
   /** Where the handle was grabbed, while it is being dragged. */
   const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const isNarrow = useIsNarrow();
+  const [noteEditorRange, setNoteEditorRange] = useState<TextRange>();
+  const [pendingQuickSelection, setPendingQuickSelection] = useState<PendingQuickSelection | null>(
+    null,
+  );
+  const pendingQuickSelectionRef = useRef<PendingQuickSelection | null>(null);
+  const [selectionSaveError, setSelectionSaveError] = useState<string | null>(null);
+  const [quickSubmitInFlight, setQuickSubmitInFlight] = useState(false);
+  const quickSubmitInFlightRef = useRef(false);
 
   // Only the URL the document was loaded with can carry a text fragment
   const linkedPassage = useMemo(
@@ -161,6 +198,114 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
   // saving on its own would have this browser conflicting with itself before
   // any second device got the chance to. One body of text, one queue.
   const note = useNoteSession(pdfId);
+  const { addHighlight } = useHighlights(pdfId);
+  const { store: storeSelection } = useStoreSelection(addHighlight, saveSelection);
+  const quickSelectionPreparationBlocked =
+    note.status === "loading" ||
+    pendingQuickSelection !== null ||
+    quickSubmitInFlight ||
+    note.quickAppending ||
+    note.quickAppendError !== null;
+  const quickSelectionPreparationBlockedRef = useRef(quickSelectionPreparationBlocked);
+  quickSelectionPreparationBlockedRef.current = quickSelectionPreparationBlocked;
+
+  const updatePendingQuickSelection = useCallback((next: PendingQuickSelection | null) => {
+    pendingQuickSelectionRef.current = next;
+    setPendingQuickSelection(next);
+  }, []);
+
+  /** Put the note on screen before writing into an otherwise hidden place. */
+  const revealNote = useCallback(() => {
+    setRightPaneTab("note");
+    if (isNarrow) {
+      setChatSheet((sheet) => (sheet === "closed" ? "half" : sheet));
+    } else {
+      setChatPanelOpen(true);
+    }
+  }, [isNarrow, setChatPanelOpen, setChatSheet, setRightPaneTab]);
+
+  const handleAddSelectionToNote = useCallback(
+    (selection: CreatedSelection) => {
+      if (note.status === "loading") return;
+      const insertion = note.insert(formatSelectionNote(selection), noteEditorRange);
+      setNoteEditorRange(insertion.range);
+      revealNote();
+    },
+    [note, noteEditorRange, revealNote],
+  );
+
+  const handlePrepareSelectionQuickNote = useCallback(
+    (draft: SelectionDraft) => {
+      if (
+        quickSelectionPreparationBlockedRef.current ||
+        quickSubmitInFlightRef.current ||
+        pendingQuickSelectionRef.current !== null
+      ) {
+        return;
+      }
+      updatePendingQuickSelection({ kind: "draft", draft });
+      setSelectionSaveError(null);
+      revealNote();
+    },
+    [note.status, revealNote, updatePendingQuickSelection],
+  );
+
+  const handleQuickNoteSubmit = useCallback(
+    async (text: string): Promise<boolean> => {
+      if (quickSubmitInFlightRef.current || note.status === "loading") return false;
+      if (note.quickAppendError !== null) return false;
+      const pending = pendingQuickSelectionRef.current;
+      if (!pending && text.trim() === "") return false;
+
+      quickSubmitInFlightRef.current = true;
+      setQuickSubmitInFlight(true);
+      setSelectionSaveError(null);
+      try {
+        let stored = pending;
+        if (stored?.kind === "draft") {
+          if (!pdfId) return false;
+          const result = await storeSelection(pdfId, stored.draft);
+          if (result.isErr()) {
+            setSelectionSaveError(result.error.message);
+            return false;
+          }
+          stored = { kind: "stored", draft: stored.draft, selection: result.value };
+          // Written before note.appendQuick starts: a note failure must leave
+          // this exact id available to retry without another selection POST.
+          updatePendingQuickSelection(stored);
+        }
+
+        const entry = stored ? formatSelectionNote(stored.selection, text) : text.trim();
+        const saved = await note.appendQuick(entry);
+        if (saved) {
+          updatePendingQuickSelection(null);
+          setSelectionSaveError(null);
+        }
+        return saved;
+      } finally {
+        quickSubmitInFlightRef.current = false;
+        setQuickSubmitInFlight(false);
+      }
+    },
+    [note, pdfId, storeSelection, updatePendingQuickSelection],
+  );
+
+  const handleQuickNoteRetry = useCallback(async (): Promise<boolean> => {
+    if (quickSubmitInFlightRef.current) return false;
+    quickSubmitInFlightRef.current = true;
+    setQuickSubmitInFlight(true);
+    try {
+      const saved = await note.retryQuickAppend();
+      if (saved) {
+        updatePendingQuickSelection(null);
+        setSelectionSaveError(null);
+      }
+      return saved;
+    } finally {
+      quickSubmitInFlightRef.current = false;
+      setQuickSubmitInFlight(false);
+    }
+  }, [note, updatePendingQuickSelection]);
 
   const handleSelectionClick = useCallback(
     (selection: ActiveSelection) => {
@@ -303,6 +448,12 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
             book={book}
             bookError={error as Error | undefined}
             onSelectionClick={handleSelectionClick}
+            measureSelection={measureSelection}
+            saveSelection={saveSelection}
+            onAddSelectionToNote={note.status === "loading" ? undefined : handleAddSelectionToNote}
+            onPrepareSelectionQuickNote={
+              quickSelectionPreparationBlocked ? undefined : handlePrepareSelectionQuickNote
+            }
           />
         </div>
 
@@ -313,6 +464,13 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
               bookError={error as Error | undefined}
               onSelectionClick={handleSelectionClick}
               note={note}
+              noteEditorRange={noteEditorRange}
+              onNoteEditorRangeChange={setNoteEditorRange}
+              pendingNoteSelection={pendingQuickSelection?.draft}
+              noteSelectionSaveError={selectionSaveError}
+              noteSelectionSaving={quickSubmitInFlight}
+              onQuickNoteSubmit={handleQuickNoteSubmit}
+              onQuickNoteRetry={handleQuickNoteRetry}
             />
           </ChatSheet>
         )}
@@ -389,6 +547,13 @@ function BookReader({ pdfId }: { pdfId: string | undefined }) {
                 bookError={error as Error | undefined}
                 onSelectionClick={handleSelectionClick}
                 note={note}
+                noteEditorRange={noteEditorRange}
+                onNoteEditorRangeChange={setNoteEditorRange}
+                pendingNoteSelection={pendingQuickSelection?.draft}
+                noteSelectionSaveError={selectionSaveError}
+                noteSelectionSaving={quickSubmitInFlight}
+                onQuickNoteSubmit={handleQuickNoteSubmit}
+                onQuickNoteRetry={handleQuickNoteRetry}
               />
             </div>
           </>

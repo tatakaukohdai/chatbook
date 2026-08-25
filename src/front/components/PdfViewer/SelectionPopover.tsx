@@ -11,6 +11,10 @@ interface SelectionPopoverProps {
    * stored, and a popover that stays open is one that can be submitted twice.
    */
   onSubmit: (question: string) => void | Promise<void>;
+  /** Adds the selected passage to notes through the viewer's width-aware flow. */
+  onAddToNote?: () => void | Promise<void>;
+  /** The passage is being persisted before the note callback can run. */
+  addingToNote?: boolean;
   onDismiss: () => void;
   /**
    * Whether it is floating over the passage, which is where its card and the
@@ -29,6 +33,8 @@ interface SelectionPopoverProps {
 export function SelectionPopover({
   quote,
   onSubmit,
+  onAddToNote,
+  addingToNote = false,
   onDismiss,
   floating = true,
 }: SelectionPopoverProps) {
@@ -94,15 +100,21 @@ export function SelectionPopover({
       }
     };
     // Delay to avoid dismissing on the same mouseup that triggered this
-    setTimeout(() => document.addEventListener("mousedown", handleClick), 0);
-    return () => document.removeEventListener("mousedown", handleClick);
+    const listenerTimer = window.setTimeout(
+      () => document.addEventListener("mousedown", handleClick),
+      0,
+    );
+    return () => {
+      window.clearTimeout(listenerTimer);
+      document.removeEventListener("mousedown", handleClick);
+    };
   }, [onDismiss]);
 
   const handleSubmit = async () => {
     const q = question.trim();
     // One ask at a time. Both routes in (the button and Enter) come through
     // here, so this is the only gate needed.
-    if (!q || asking) return;
+    if (!q || asking || addingToNote) return;
 
     setAsking(true);
     try {
@@ -143,12 +155,23 @@ export function SelectionPopover({
         value={question}
         onChange={(e) => setQuestion(e.target.value)}
         onKeyDown={handleKeyDown}
+        aria-label="選択した文章について質問"
         placeholder="選択した文章について質問する..."
-        readOnly={asking}
+        readOnly={asking || addingToNote}
         className="w-full min-w-[280px] p-2 text-sm border border-gray-300 rounded-md resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent read-only:bg-gray-50"
         rows={2}
       />
-      <div className="flex justify-end gap-2 mt-2">
+      <div className="mt-2 flex items-center justify-end gap-2">
+        {onAddToNote ? (
+          <button
+            type="button"
+            onClick={() => void onAddToNote()}
+            disabled={asking || addingToNote}
+            className="mr-auto h-11 min-w-11 rounded-md bg-amber-100 px-3 text-xs font-semibold text-amber-900 hover:bg-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {addingToNote ? "メモに追加中..." : "メモに追加"}
+          </button>
+        ) : null}
         <button
           type="button"
           onClick={onDismiss}
@@ -159,7 +182,7 @@ export function SelectionPopover({
         <button
           type="button"
           onClick={() => void handleSubmit()}
-          disabled={!question.trim() || asking}
+          disabled={!question.trim() || asking || addingToNote}
           className="px-3 py-1 text-xs bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
         >
           {asking ? "送信中..." : "質問する"}

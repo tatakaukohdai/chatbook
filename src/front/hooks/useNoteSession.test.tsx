@@ -282,6 +282,420 @@ describe("useNoteSession", () => {
     expect(sent).toHaveLength(2);
   });
 
+  describe("local insertions", () => {
+    it("inserts into the current body even when called through an older render", () => {
+      const { session } = noteHarness();
+      const olderRender = session();
+
+      act(() => session().edit("現在の本文"));
+      let insertion!: ReturnType<typeof olderRender.insert>;
+      act(() => {
+        insertion = olderRender.insert("**追記**", { start: 3, end: 3 });
+      });
+
+      expect(insertion).toStrictEqual({
+        body: "現在の**追記**本文",
+        range: { start: 9, end: 9 },
+      });
+      expect(session().body).toBe("現在の**追記**本文");
+    });
+
+    it("keeps an insertion made during a save and sends it through the ordinary queue", async () => {
+      const { session, sent, type, answer, draftIn } = noteHarness();
+      await type("送信中の本文");
+
+      act(() => {
+        session().insert("追記", { start: 4, end: 4 });
+      });
+      expect(session().body).toBe("送信中の追記本文");
+      expect(draftIn()?.body).toBe("送信中の追記本文");
+
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(sent).toHaveLength(1);
+
+      await answer({ version: 4 });
+      expect(session().status).toBe("dirty");
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(sent[1]).toStrictEqual({ body: "送信中の追記本文", version: 4 });
+    });
+  });
+
+  describe("position-independent quick appends", () => {
+    it("puts the entry on screen immediately and saves that local body", async () => {
+      const { session, sent, answer } = noteHarness();
+
+      let completion!: Promise<boolean>;
+      act(() => {
+        completion = session().appendQuick("3 章を読み直す");
+      });
+
+      expect(session().body).toBe("# Raft\n\n選挙の話\n\n## メモ\n\n- 3 章を読み直す");
+      expect(session().quickAppending).toBe(true);
+      expect(sent).toStrictEqual([
+        {
+          body: "# Raft\n\n選挙の話\n\n## メモ\n\n- 3 章を読み直す",
+          version: 3,
+        },
+      ]);
+
+      await answer({ version: 4 });
+      await expect(completion).resolves.toBe(true);
+      expect(session().quickAppending).toBe(false);
+      expect(session().quickAppendError).toBeNull();
+    });
+
+    it("rebases the same entry on a 409, keeps later editing, and never overlaps PUTs", async () => {
+      const { session, sent, answer } = noteHarness();
+      let completion!: Promise<boolean>;
+      act(() => {
+        completion = session().appendQuick("同じ intent");
+      });
+      expect(sent).toHaveLength(1);
+
+      act(() => session().edit(`${session().body}\n通常編集`));
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(sent).toHaveLength(1);
+
+      await answer(conflictWith("# Raft\n\n別端末の段落\n", 7));
+      expect(session().body).toContain("別端末の段落");
+      expect(session().body).toContain("通常編集");
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(sent[1]).toStrictEqual({
+        body: "# Raft\n\n別端末の段落\n\n## メモ\n\n- 同じ intent",
+        version: 7,
+      });
+
+      act(() => {
+        session().insert("さらに", { start: session().body.length, end: session().body.length });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(sent).toHaveLength(2);
+
+      await answer({ version: 8 });
+      await expect(completion).resolves.toBe(true);
+      expect(session().body).toContain("通常編集さらに");
+      expect(session().status).toBe("dirty");
+
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(sent).toHaveLength(3);
+    });
+
+    it("stops a quick append after three stale PUTs and keeps its intent", async () => {
+      const { session, sent } = noteHarness({
+        answers: [
+          conflictWith("別端末 1\n", 4),
+          conflictWith("別端末 2\n", 5),
+          conflictWith("別端末 3\n", 6),
+        ],
+      });
+
+      let completion!: Promise<boolean>;
+      act(() => {
+        completion = session().appendQuick("消さない入力");
+      });
+      await act(async () => {});
+      for (let i = 1; i < MAX_CONFLICT_RETRIES; i++) {
+        await act(async () => {
+          vi.advanceTimersByTime(DEBOUNCE);
+        });
+      }
+
+      await expect(completion).resolves.toBe(false);
+      expect(sent).toHaveLength(MAX_CONFLICT_RETRIES);
+      expect(session().body).toContain("消さない入力");
+      expect(session().quickAppendError).toContain("保存を中断");
+      expect(session().quickAppending).toBe(false);
+    });
+
+    it("keeps a failed intent and retries it without rebuilding the entry", async () => {
+      const failed = {
+        type: "API" as const,
+        cause: new ApiError("回線が切れました", "NETWORK_ERROR", 0, "network"),
+      };
+      const { session, sent } = noteHarness({ answers: [failed, { version: 4 }] });
+
+      let first!: Promise<boolean>;
+      await act(async () => {
+        first = session().appendQuick("selection=01K-を含む完成済み entry");
+        expect(await first).toBe(false);
+      });
+      expect(session().body).toContain("selection=01K-を含む完成済み entry");
+      expect(session().quickAppendError).toBe("回線が切れました");
+
+      let retried!: Promise<boolean>;
+      await act(async () => {
+        retried = session().retryQuickAppend();
+        expect(await retried).toBe(true);
+      });
+      expect(sent[1]).toStrictEqual(sent[0]);
+      expect(session().quickAppendError).toBeNull();
+    });
+
+    it("stops when rebasing concurrent free editing would leave markers", async () => {
+      const { session, sent, answer } = noteHarness({
+        server: { body: "同じ行\n", version: 3 },
+      });
+      let completion!: Promise<boolean>;
+      act(() => {
+        completion = session().appendQuick("intent");
+      });
+      act(() => session().edit(session().body.replace("同じ行", "こちらの行")));
+
+      await answer(conflictWith("あちらの行\n", 4));
+
+      await expect(completion).resolves.toBe(false);
+      expect(session().status).toBe("conflicted");
+      expect(session().body).toContain("<<<<<<< 自分");
+      expect(session().quickAppendError).toContain("別の端末");
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE * 10);
+      });
+      expect(sent).toHaveLength(1);
+    });
+
+    it("keeps an existing free-edit conflict instead of sending its markers", async () => {
+      const { session, sent, type } = noteHarness({
+        answers: [conflictWith("# Raft\n\nあちらの行\n", 4)],
+      });
+      await type("# Raft\n\nこちらの行\n");
+      expect(session().status).toBe("conflicted");
+
+      let completion!: Promise<boolean>;
+      await act(async () => {
+        completion = session().appendQuick("競合が解けるまで待つ entry");
+        expect(await completion).toBe(false);
+      });
+
+      expect(session().status).toBe("conflicted");
+      expect(session().body).toContain("競合が解けるまで待つ entry");
+      expect(session().quickAppendError).toContain("別の端末");
+      expect(sent).toHaveLength(1);
+    });
+
+    it("waits for explicit quick retry after markers are resolved", async () => {
+      const entry = "競合が解けるまで待つ entry";
+      const resolved = `解決済み\n\n## メモ\n\n- ${entry}`;
+      const { session, sent, type } = noteHarness({
+        answers: [conflictWith("# Raft\n\nあちらの行\n", 4), { version: 5 }],
+      });
+      await type("# Raft\n\nこちらの行\n");
+      await act(async () => {
+        expect(await session().appendQuick(entry)).toBe(false);
+      });
+
+      act(() => session().edit(resolved));
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+
+      expect(sent).toHaveLength(1);
+      act(() => session().save());
+      expect(sent).toHaveLength(1);
+
+      await act(async () => {
+        expect(await session().retryQuickAppend()).toBe(true);
+      });
+
+      expect(sent).toHaveLength(2);
+      expect(sent[1]).toStrictEqual({ body: resolved, version: 4 });
+      expect(sent[1].body).not.toContain("<<<<<<<");
+      expect(sent[1].body.split(entry)).toHaveLength(2);
+    });
+
+    it("rebuilds a marker-free pending attempt from the resolved body before explicit retry", async () => {
+      const entry = "明示retryまで待つ entry";
+      const resolved = `解決済み\n\n## メモ\n\n- ${entry}`;
+      const { session, sent, type } = noteHarness({
+        answers: [conflictWith("# Raft\n\nあちらの行\n", 4)],
+      });
+      await type("# Raft\n\nこちらの行\n");
+      await act(async () => {
+        expect(await session().appendQuick(entry)).toBe(false);
+      });
+      act(() => session().edit(resolved));
+
+      act(() => {
+        void session().retryQuickAppend();
+      });
+
+      expect(sent).toHaveLength(2);
+      expect(sent[1]).toStrictEqual({ body: resolved, version: 4 });
+      expect(sent[1].body).not.toContain("<<<<<<<");
+      expect(sent[1].body.split(entry)).toHaveLength(2);
+    });
+
+    it("treats a 409 carrying the attempted body as an already-landed quick append", async () => {
+      const entry = "応答だけ失われた entry";
+      const attempted = `${SERVER_NOTE.body}\n## メモ\n\n- ${entry}`;
+      const failed = {
+        type: "API" as const,
+        cause: new ApiError("応答を受け取れませんでした", "NETWORK_ERROR", 0, "network"),
+      };
+      const { session, sent } = noteHarness({
+        answers: [failed, conflictWith(attempted, 4)],
+      });
+      await act(async () => {
+        expect(await session().appendQuick(entry)).toBe(false);
+      });
+
+      const settled = vi.fn<(saved: boolean) => void>();
+      await act(async () => {
+        void session().retryQuickAppend().then(settled);
+        await Promise.resolve();
+      });
+
+      expect(settled).toHaveBeenCalledExactlyOnceWith(true);
+      expect(sent).toStrictEqual([
+        { body: attempted, version: 3 },
+        { body: attempted, version: 3 },
+      ]);
+      expect(session().body.split(entry)).toHaveLength(2);
+      expect(session().status).toBe("saved");
+      expect(session().quickAppendError).toBeNull();
+    });
+
+    it.each([
+      ["selectionless", "失敗後も保持する一言メモ"],
+      [
+        "selected",
+        "> 引用\n\n失敗後も保持する選択メモ\n\n<sup>[p.3](?page=3&selection=01K-STABLE)</sup>",
+      ],
+    ])(
+      "keeps a failed %s quick intent paused through resize, editing, and generic save",
+      async (_kind, entry) => {
+        setViewportWidth(PHONE_WIDTH);
+        const failed = {
+          type: "API" as const,
+          cause: new ApiError("回線が切れました", "NETWORK_ERROR", 0, "network"),
+        };
+        const { session, sent } = noteHarness({ answers: [failed, { version: 4 }] });
+
+        await act(async () => {
+          expect(await session().appendQuick(entry)).toBe(false);
+        });
+        expect(sent).toHaveLength(1);
+
+        await act(async () => {
+          setViewportWidth(1280);
+        });
+        act(() => session().edit(`${session().body}\n広い画面での自由編集`));
+        await act(async () => {
+          vi.advanceTimersByTime(DEBOUNCE);
+        });
+        act(() => session().save());
+
+        expect(sent).toHaveLength(1);
+
+        await act(async () => {
+          expect(await session().retryQuickAppend()).toBe(true);
+        });
+        expect(sent).toHaveLength(2);
+        expect(sent[1]).toStrictEqual(sent[0]);
+      },
+    );
+
+    it("recognizes a durable quick-entry delta in a 409 with later remote changes", async () => {
+      const entry = "応答喪失後も一度だけの entry";
+      const attempted = `${SERVER_NOTE.body}\n## メモ\n\n- ${entry}`;
+      const current = `${attempted}\n\n## 別端末の追記\n\nサーバ側の変更\n`;
+      const localEdit = attempted.replace("選挙の話", "選挙の話（ローカル補足）");
+      const merged = current.replace("選挙の話", "選挙の話（ローカル補足）");
+      const failed = {
+        type: "API" as const,
+        cause: new ApiError("応答を受け取れませんでした", "NETWORK_ERROR", 0, "network"),
+      };
+      const { session, sent } = noteHarness({
+        answers: [failed, conflictWith(current, 5)],
+      });
+      await act(async () => {
+        expect(await session().appendQuick(entry)).toBe(false);
+      });
+      act(() => session().edit(localEdit));
+
+      const settled = vi.fn<(saved: boolean) => void>();
+      await act(async () => {
+        void session().retryQuickAppend().then(settled);
+        await Promise.resolve();
+      });
+
+      expect(settled).toHaveBeenCalledExactlyOnceWith(true);
+      expect(sent).toStrictEqual([
+        { body: attempted, version: 3 },
+        { body: attempted, version: 3 },
+      ]);
+      expect(session().body).toBe(merged);
+      expect(session().body.split(entry)).toHaveLength(2);
+      expect(session().status).toBe("dirty");
+      expect(session().quickAppendError).toBeNull();
+
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(sent[2]).toStrictEqual({ body: merged, version: 5 });
+    });
+
+    it("does not mistake an older identical entry for the attempted canonical increment", async () => {
+      const entry = "同じ文面でも別の quick intent";
+      const base = `# Raft\n\n元の段落\n\n## メモ\n\n- ${entry}`;
+      const attempted = `${base}\n- ${entry}`;
+      const current = `# Raft\n\n別端末の補足\n\n元の段落\n\n## メモ\n\n- ${entry}`;
+      const rebased = `${current}\n- ${entry}`;
+      const failed = {
+        type: "API" as const,
+        cause: new ApiError("応答を受け取れませんでした", "NETWORK_ERROR", 0, "network"),
+      };
+      const { session, sent } = noteHarness({
+        server: { body: base, version: 3 },
+        answers: [failed, conflictWith(current, 5), { version: 6 }],
+      });
+      await act(async () => {
+        expect(await session().appendQuick(entry)).toBe(false);
+      });
+
+      const settled = vi.fn<(saved: boolean) => void>();
+      await act(async () => {
+        void session().retryQuickAppend().then(settled);
+        await Promise.resolve();
+      });
+
+      expect(settled).not.toHaveBeenCalled();
+      await act(async () => {
+        vi.advanceTimersByTime(DEBOUNCE);
+      });
+      expect(settled).toHaveBeenCalledExactlyOnceWith(true);
+      expect(sent).toStrictEqual([
+        { body: attempted, version: 3 },
+        { body: attempted, version: 3 },
+        { body: rebased, version: 5 },
+      ]);
+      expect(session().body).toBe(rebased);
+      expect(session().body.split(entry)).toHaveLength(3);
+    });
+
+    it("does not create a narrow-screen draft for a quick append", async () => {
+      setViewportWidth(PHONE_WIDTH);
+      const { session, draftIn } = noteHarness({ answers: [{ version: 4 }] });
+
+      await act(async () => {
+        await session().appendQuick("電話の入力");
+      });
+
+      expect(draftIn()).toBeNull();
+    });
+  });
+
   describe("the copy kept on this device", () => {
     it("keeps unsaved text where a closed tab can still be got at it", async () => {
       const { draftIn, type } = noteHarness();

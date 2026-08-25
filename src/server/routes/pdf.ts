@@ -508,20 +508,55 @@ export function createPdfRoute(idClock: IdClock = systemIdClock) {
         // Validated, so positionData is already down to the shape the viewer
         // draws from: the measurement's other fields are stripped here rather
         // than stored and read back as an unknown blob.
-        const { selectedText, pageNumber, positionData } = c.req.valid("json");
+        const { requestId, selectedText, pageNumber, positionData } = c.req.valid("json");
 
-        const id = idClock.newId();
+        // The operation id doubles as the selection id. That gives a replay a
+        // unique constraint already present in every deployment, without a new
+        // table or a second identifier that could drift away from the row it
+        // protects. Older clients omit it and keep the pre-idempotency path.
+        const id = requestId ?? idClock.newId();
         const now = idClock.now();
-        await d1Db.insert(selections).values({
-          id,
-          pdfId,
-          selectedText,
-          pageNumber,
-          positionData: JSON.stringify(positionData),
-          createdAt: now,
-        });
+        const serializedPosition = JSON.stringify(positionData);
+        const inserted = await d1Db
+          .insert(selections)
+          .values({
+            id,
+            pdfId,
+            selectedText,
+            pageNumber,
+            positionData: serializedPosition,
+            createdAt: now,
+          })
+          .onConflictDoNothing({ target: selections.id })
+          .returning()
+          .all();
+        const stored =
+          inserted[0] ?? (await d1Db.select().from(selections).where(eq(selections.id, id)).get());
 
-        return c.json({ id, selectedText, pageNumber, positionData, createdAt: now }, 201);
+        // A random id collision is fantastically unlikely, but returning some
+        // other operation's highlight would be worse than refusing it plainly.
+        if (
+          !stored ||
+          stored.pdfId !== pdfId ||
+          stored.selectedText !== selectedText ||
+          stored.pageNumber !== pageNumber ||
+          stored.positionData !== serializedPosition
+        ) {
+          return c.json(
+            {
+              error: {
+                code: "SELECTION_REQUEST_CONFLICT" satisfies ErrorCode,
+                message: "Selection request id is already in use",
+              },
+            },
+            409,
+          );
+        }
+
+        return c.json(
+          { id, selectedText, pageNumber, positionData, createdAt: stored.createdAt },
+          inserted.length > 0 ? 201 : 200,
+        );
       })
       .get("/pdf/:pdfId/selections/:selId/chats", async (c) => {
         const selId = c.req.param("selId");

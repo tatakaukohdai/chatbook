@@ -2075,6 +2075,125 @@ test("copies the passage a reader chose with the question box over it", async ({
   await expect(box).toHaveValue(COVER_TITLE);
 });
 
+test("inserts a dragged passage at the note caret and follows its durable link", async ({
+  page,
+}) => {
+  const pdfId = await openTestBook(page);
+  const passagePage = 2;
+  const passage = pageText(passagePage).body[0];
+  await page.goto(`/books/${pdfId}?page=${passagePage}`);
+  const line = drawnPage(page, passagePage).filter({ hasText: passage }).first();
+  await expect(line).toBeVisible({ timeout: 60000 });
+
+  await page.getByRole("tab", { name: "メモ" }).click();
+  const editor = page.getByRole("textbox", { name: "読書メモ" });
+  const existingBody = "既存の前半\n\n\n既存の後半";
+  const insertionPoint = "既存の前半\n\n".length;
+  await editor.fill(existingBody);
+  await editor.evaluate((node, caret) => {
+    const textarea = node as HTMLTextAreaElement;
+    textarea.focus();
+    textarea.setSelectionRange(caret + 1, caret + 1);
+  }, insertionPoint);
+  // Let the browser emit the same selection event as a reader moving the
+  // caret. A hand-built `select` Event does not pass through React's onSelect
+  // plugin in Chromium and would leave the range recorded at fill's end.
+  await page.keyboard.press("ArrowLeft");
+  await expect
+    .poll(() => editor.evaluate((node) => (node as HTMLTextAreaElement).selectionStart))
+    .toBe(insertionPoint);
+  await expect(page.getByText("未保存", { exact: true })).toBeVisible();
+
+  const selected = await dragAndReadPassage(page, line, line);
+  expect(selected).toBe(passage);
+  const add = page.getByRole("button", { name: "メモに追加" });
+  await expect(add).toBeVisible({ timeout: 10000 });
+
+  const selectionSaved = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/pdf/${pdfId}/selections`) &&
+      response.request().method() === "POST" &&
+      response.ok(),
+  );
+  const noteSaved = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/pdf/${pdfId}/note`) &&
+      response.request().method() === "PUT" &&
+      response.request().postData()?.includes(passage) === true &&
+      response.ok(),
+  );
+  await add.click();
+
+  const selectionResponse = await selectionSaved;
+  await noteSaved;
+  const created = (await selectionResponse.json()) as {
+    id: string;
+    selectedText: string;
+    pageNumber: number;
+  };
+  expect(created.selectedText).toBe(passage);
+  expect(created.pageNumber).toBe(passagePage);
+  expect(created.id).not.toBe("");
+
+  const insertedBody = `${existingBody.slice(0, insertionPoint)}> ${passage}\n\n<sup>[p.${passagePage}](?page=${passagePage}&selection=${created.id})</sup>${existingBody.slice(insertionPoint)}`;
+  await expect(editor).toHaveValue(insertedBody);
+  await expect(page.getByRole("tab", { name: "メモ" })).toHaveAttribute("aria-selected", "true");
+  await expect(editor).toBeVisible();
+  await expect(page.getByText("保存済み", { exact: true })).toBeVisible({ timeout: 15000 });
+
+  await page.goto(`/books/${pdfId}?page=1`);
+  await page.getByRole("tab", { name: "メモ" }).click();
+  await expect(editor).toHaveValue(insertedBody);
+  await expect(page.getByText(passage, { exact: true })).toBeVisible();
+
+  const link = page.getByRole("link", { name: `p.${passagePage}` });
+  await expect(link).toHaveAttribute(
+    "href",
+    `?page=${passagePage}&selection=${encodeURIComponent(created.id)}`,
+  );
+  await page.evaluate(() => {
+    // A full document navigation would create a new Window and drop this.
+    // The preview link must instead use the reader's existing selection route.
+    (window as Window & { __noteLinkDocumentSentinel?: string }).__noteLinkDocumentSentinel =
+      "same-reader-document";
+  });
+  await link.click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as Window & { __noteLinkDocumentSentinel?: string }).__noteLinkDocumentSentinel,
+      ),
+    )
+    .toBe("same-reader-document");
+  await expect
+    .poll(() => {
+      const params = new URL(page.url()).searchParams;
+      return { page: params.get("page"), selection: params.get("selection") };
+    })
+    .toEqual({ page: String(passagePage), selection: created.id });
+  await expect(drawnPage(page, passagePage).first()).toBeVisible({ timeout: 60000 });
+  await expect(
+    page.getByRole("button", { name: "ハイライトのチャットを開く" }).first(),
+  ).toBeVisible();
+
+  await page.getByRole("tab", { name: "チャット" }).click();
+  await expect(page.getByRole("tab", { name: "チャット" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  const questionInput = page.getByPlaceholder("質問を入力...");
+  await expect(questionInput).toBeVisible();
+  const chatInput = questionInput.locator("..").locator("..");
+  await expect(chatInput.locator("p")).toHaveText(passage);
+
+  const durable = (await (await page.request.get(`/api/pdf/${pdfId}/note`)).json()) as {
+    body: string;
+  };
+  expect(durable.body).toBe(insertedBody);
+});
+
 test("what the reader writes in the note is still there after a reload", async ({ page }) => {
   // The whole stack in one go: the pane's textarea, the session behind it, the
   // debounced save, and the row in D1. The note is the one thing here a reader

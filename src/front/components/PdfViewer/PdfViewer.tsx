@@ -9,7 +9,7 @@ import {
   citedPassageAtom,
 } from "../../atoms/pdfAtom";
 import type { ActiveSelection } from "../../atoms/chatAtom";
-import type { SelectionRect } from "../../../shared/schemas/selection";
+import type { CreatedSelection, SelectionRect } from "../../../shared/schemas/selection";
 import type { BookDetail } from "../../../shared/schemas/book";
 import { PdfPage } from "./PdfPage";
 import { PdfOutline } from "./PdfOutline";
@@ -28,7 +28,12 @@ import { nextZoom } from "../../lib/pageScale";
 import { fitsTwoPages, lastSpreadStart, turnTo, visiblePages } from "../../lib/spread";
 import { usePageBaseSize } from "../../hooks/usePageBaseSize";
 import { pinchZoom, resolveSwipe, resolveTapZone, type PageTurn } from "../../lib/touchNavigation";
-import { useAskAboutSelection, type SaveSelection } from "../../hooks/useAskAboutSelection";
+import { useAskAboutSelection } from "../../hooks/useAskAboutSelection";
+import {
+  useStoreSelection,
+  type SaveSelection,
+  type SelectionDraft,
+} from "../../hooks/useStoreSelection";
 import { useHighlights } from "../../hooks/useHighlights";
 import { useSettledSelection } from "../../hooks/useSettledSelection";
 import { useIsNarrow } from "../../hooks/useIsNarrow";
@@ -58,6 +63,10 @@ interface PdfViewerProps {
   measureSelection?: MeasureSelection;
   /** Stores the highlight; injectable so a failed save can be tested. */
   saveSelection?: SaveSelection;
+  /** Receives a stored passage for insertion into the wide note editor. */
+  onAddSelectionToNote?: (selection: CreatedSelection) => void;
+  /** Receives an unsaved snapshot for the narrow quick-note input. */
+  onPrepareSelectionQuickNote?: (draft: SelectionDraft) => void;
 }
 
 /** How far a finger may stray and still have been a tap rather than a drag. */
@@ -173,6 +182,8 @@ export function PdfViewer({
   onSelectionClick,
   measureSelection = measureSelectionOnPage,
   saveSelection,
+  onAddSelectionToNote,
+  onPrepareSelectionQuickNote,
 }: PdfViewerProps) {
   const [currentPage, setCurrentPage] = useAtom(currentPageAtom);
   const useWebSearch = useAtomValue(useWebSearchAtom);
@@ -235,7 +246,26 @@ export function PdfViewer({
   const offerFirst = isNarrow || chosenByFinger;
   const { pdfDocument, error: documentError } = usePdfDocument(pdfId, book);
   const { outline, error: outlineError } = usePdfOutline(pdfDocument);
-  const { askAboutSelection, saveError } = useAskAboutSelection(addHighlight, saveSelection);
+  const { askAboutSelection, saveError, clearSaveError } = useAskAboutSelection(
+    addHighlight,
+    saveSelection,
+  );
+  const { store: storeSelection } = useStoreSelection(addHighlight, saveSelection);
+  // State updates only disable controls after React renders again. Both save
+  // entry points acquire this synchronously so two events in the same batch
+  // cannot persist the same selection twice.
+  const selectionSaveInFlight = useRef(false);
+  // Generated when a passage settles and kept while its popover stays open.
+  // If D1 committed but the response was lost, the next click must replay the
+  // same operation id so the server can return that row instead of duplicating it.
+  const selectionRequestId = useRef<string | null>(null);
+  // A selection POST can outlive a caret move or a wide/narrow layout change
+  // in the parent. Keep the immutable selection draft from the click, but hand
+  // the stored result to the latest destination callback.
+  const addSelectionToNoteRef = useRef(onAddSelectionToNote);
+  addSelectionToNoteRef.current = onAddSelectionToNote;
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [noteSaveError, setNoteSaveError] = useState<string | null>(null);
   // Kept with the page it happened on, so turning away from a page that could
   // not be drawn takes its message with it.
   const [renderError, setRenderError] = useState<{ page: number; message: string } | null>(null);
@@ -625,54 +655,146 @@ export function PdfViewer({
       (pointerType: string | null) => {
         const measured = measureSelection(selectedPageElement());
         if (!measured) return;
+        setNoteSaveError(null);
+        clearSaveError();
+        selectionRequestId.current = globalThis.crypto.randomUUID();
         setPopoverState(measured);
         setChosenByFinger(pointerType === "touch");
       },
-      [measureSelection],
+      [clearSaveError, measureSelection],
     ),
     { enabled: !questionOpen },
   );
 
   const handlePopoverSubmit = useCallback(
     async (question: string) => {
-      if (!popoverState || !book) return;
+      const requestId = selectionRequestId.current;
+      if (!popoverState || !book || !requestId || selectionSaveInFlight.current) return;
+      selectionSaveInFlight.current = true;
+      setNoteSaveError(null);
+      try {
+        const asked = await askAboutSelection(
+          book.id,
+          {
+            requestId,
+            selectedText: popoverState.selectedText,
+            pageNumber: popoverState.selectionPosition.pageNumber,
+            // The rest of the measurement (the text offsets the passage was
+            // found at) is stripped by the endpoint.
+            positionData: popoverState.selectionPosition,
+          },
+          question,
+          useWebSearch,
+        );
 
-      const asked = await askAboutSelection(
-        book.id,
-        {
-          selectedText: popoverState.selectedText,
-          pageNumber: popoverState.selectionPosition.pageNumber,
-          // The rest of the measurement (the text offsets the passage was
-          // found at) is stripped by the endpoint.
-          positionData: popoverState.selectionPosition,
-        },
-        question,
-        useWebSearch,
-      );
-
-      // Closing on the stored highlight rather than on the answer: the answer
-      // takes seconds, and a popover held open for it would sit over the page
-      // the whole time. A highlight that was not stored keeps the popover, and
-      // the question in it, so the reader can send it again.
-      if (asked.isOk()) {
-        setPopoverState(null);
-        setQuestionOpen(false);
+        // Closing on the stored highlight rather than on the answer: the answer
+        // takes seconds, and a popover held open for it would sit over the page
+        // the whole time. A highlight that was not stored keeps the popover, and
+        // the question in it, so the reader can send it again.
+        if (asked.isOk() && selectionRequestId.current === requestId) {
+          selectionRequestId.current = null;
+          setPopoverState(null);
+          setQuestionOpen(false);
+        } else if (asked.isErr() && selectionRequestId.current !== requestId) {
+          // The hook reports storage failures for the operation that just
+          // finished. If the reader has selected B while A was saving, that
+          // message belongs to A and must not be painted onto B's popover.
+          clearSaveError();
+        }
+      } finally {
+        selectionSaveInFlight.current = false;
       }
     },
-    [popoverState, book, askAboutSelection, useWebSearch],
+    [popoverState, book, askAboutSelection, clearSaveError, useWebSearch],
   );
 
   const handlePopoverDismiss = useCallback(() => {
+    setNoteSaveError(null);
+    clearSaveError();
+    selectionRequestId.current = null;
     setPopoverState(null);
     setQuestionOpen(false);
     window.getSelection()?.removeAllRanges();
-  }, []);
+  }, [clearSaveError]);
 
   /**
    * Closing the question box leaves the passage selected and the offer up: the
    * reader changed their mind about typing, not about the passage.
    */
   const handleQuestionClose = useCallback(() => setQuestionOpen(false), []);
+
+  /** A complete, immutable copy of the passage currently offered to the reader. */
+  const currentSelectionDraft = useCallback((): SelectionDraft | null => {
+    const requestId = selectionRequestId.current;
+    if (!popoverState || !requestId) return null;
+    return {
+      requestId,
+      selectedText: popoverState.selectedText,
+      pageNumber: popoverState.selectionPosition.pageNumber,
+      // Keep the text offsets as part of the snapshot. The selection endpoint
+      // strips them, while the narrow flow can still identify exactly what the
+      // reader had selected before its one-line input opens.
+      positionData: popoverState.selectionPosition,
+    };
+  }, [popoverState]);
+
+  const handleAddSelectionToNote = useCallback(async () => {
+    const draft = currentSelectionDraft();
+    if (!draft || !book || selectionSaveInFlight.current) return;
+
+    // Narrow notes collect the optional comment before persisting anything.
+    // Width decides this storage policy; a finger on a wide tablet still uses
+    // the action bar but follows the wide, selection-first path below.
+    if (isNarrow) {
+      if (!onPrepareSelectionQuickNote) return;
+      selectionSaveInFlight.current = true;
+      try {
+        onPrepareSelectionQuickNote(draft);
+        handlePopoverDismiss();
+      } finally {
+        selectionSaveInFlight.current = false;
+      }
+      return;
+    }
+
+    if (!onAddSelectionToNote) return;
+    selectionSaveInFlight.current = true;
+    setNoteSaving(true);
+    setNoteSaveError(null);
+    clearSaveError();
+    try {
+      const stored = await storeSelection(book.id, draft);
+      if (stored.isErr()) {
+        // A save can finish after the reader has already selected another
+        // passage. Only the operation still represented by the popover owns
+        // its error surface.
+        if (selectionRequestId.current === draft.requestId) {
+          setNoteSaveError(stored.error.message);
+        }
+        return;
+      }
+
+      const addSelectionToNote = addSelectionToNoteRef.current;
+      if (!addSelectionToNote) return;
+      addSelectionToNote(stored.value);
+      // Storing A and inserting it into the latest note destination still
+      // complete, but A must not dismiss a newer selection B.
+      if (selectionRequestId.current === draft.requestId) {
+        handlePopoverDismiss();
+      }
+    } finally {
+      selectionSaveInFlight.current = false;
+      setNoteSaving(false);
+    }
+  }, [
+    book,
+    clearSaveError,
+    currentSelectionDraft,
+    handlePopoverDismiss,
+    isNarrow,
+    onPrepareSelectionQuickNote,
+    storeSelection,
+  ]);
 
   const handleHighlightClick = useCallback(
     (selectionId: string) => {
@@ -740,9 +862,9 @@ export function PdfViewer({
         </div>
       ) : null}
 
-      {saveError !== null ? (
+      {noteSaveError !== null || saveError !== null ? (
         <p role="alert" className="m-2 rounded-md bg-red-50 p-3 text-sm text-red-600">
-          ハイライトを保存できませんでした: {saveError}
+          ハイライトを保存できませんでした: {noteSaveError ?? saveError}
         </p>
       ) : null}
 
@@ -866,6 +988,10 @@ export function PdfViewer({
                           <SelectionPopover
                             quote={popoverState.selectedText}
                             onSubmit={handlePopoverSubmit}
+                            onAddToNote={
+                              onAddSelectionToNote ? handleAddSelectionToNote : undefined
+                            }
+                            addingToNote={noteSaving}
                             onDismiss={handlePopoverDismiss}
                           />
                         </div>
@@ -901,6 +1027,16 @@ export function PdfViewer({
         <SelectionActionBar
           quote={popoverState.selectedText}
           onAsk={() => setQuestionOpen(true)}
+          onAddToNote={
+            isNarrow
+              ? onPrepareSelectionQuickNote
+                ? handleAddSelectionToNote
+                : undefined
+              : onAddSelectionToNote
+                ? handleAddSelectionToNote
+                : undefined
+          }
+          addingToNote={noteSaving}
           onDismiss={handlePopoverDismiss}
         />
       )}
@@ -910,6 +1046,16 @@ export function PdfViewer({
           <SelectionPopover
             quote={popoverState.selectedText}
             onSubmit={handlePopoverSubmit}
+            onAddToNote={
+              isNarrow
+                ? onPrepareSelectionQuickNote
+                  ? handleAddSelectionToNote
+                  : undefined
+                : onAddSelectionToNote
+                  ? handleAddSelectionToNote
+                  : undefined
+            }
+            addingToNote={noteSaving}
             onDismiss={handleQuestionClose}
             floating={false}
           />

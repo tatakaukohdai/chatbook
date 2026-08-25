@@ -2,6 +2,8 @@ interface SelectionActionBarProps {
   /** The passage the reader has settled on, shown back to them. */
   quote: string;
   onAsk: () => void;
+  onAddToNote?: () => void | Promise<void>;
+  addingToNote?: boolean;
   onDismiss: () => void;
 }
 
@@ -18,7 +20,13 @@ interface SelectionActionBarProps {
  * The passage is quoted back because a phone's selection is easy to get wrong
  * by a word, and this is where that shows before a highlight is stored.
  */
-export function SelectionActionBar({ quote, onAsk, onDismiss }: SelectionActionBarProps) {
+export function SelectionActionBar({
+  quote,
+  onAsk,
+  onAddToNote,
+  addingToNote = false,
+  onDismiss,
+}: SelectionActionBarProps) {
   return (
     <div className="absolute inset-x-0 bottom-0 z-40 flex items-center gap-2 bg-gray-900 px-3 py-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] shadow-[0_-6px_24px_rgba(19,26,41,0.3)]">
       <p className="min-w-0 flex-1 truncate text-sm text-gray-200">{`“${quote}”`}</p>
@@ -37,9 +45,20 @@ export function SelectionActionBar({ quote, onAsk, onDismiss }: SelectionActionB
           <path d="M6 6l12 12M18 6L6 18" />
         </svg>
       </button>
+      {onAddToNote ? (
+        <button
+          type="button"
+          onClick={() => void onAddToNote()}
+          disabled={addingToNote}
+          className="h-11 shrink-0 rounded-lg bg-amber-500 px-4 text-sm font-semibold text-gray-950 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {addingToNote ? "メモに追加中..." : "メモに追加"}
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={onAsk}
+        disabled={addingToNote}
         className="h-11 shrink-0 rounded-lg bg-blue-600 px-4 text-sm font-semibold text-white"
       >
         AIに質問

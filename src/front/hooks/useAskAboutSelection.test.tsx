@@ -20,6 +20,7 @@ const QUESTION = "この段落を一言で要約して";
 const PASSAGE = "エッジはサーバーレス実行基盤です。";
 
 const DRAFT = {
+  requestId: "7e0055d7-5bc3-40af-bab4-4db62a9f8ef9",
   selectedText: PASSAGE,
   pageNumber: 42,
   positionData: { rects: [{ x: 10, y: 20, width: 100, height: 16 }], pageWidth: 600 },

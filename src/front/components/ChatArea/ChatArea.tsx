@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useRef, useState } from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import {
   chatMessagesAtom,
@@ -21,8 +21,9 @@ import { useHighlightSearch, type SearchSelections } from "../../hooks/useHighli
 import { formatQuotedQuestion } from "../../lib/quotedQuestion";
 import type { ReadChatQuote } from "../../lib/chatQuoteSelection";
 import { rightPaneTabAtom, type RightPaneTab } from "../../atoms/noteAtom";
-import { NotePane } from "../NotePane/NotePane";
+import { NotePane, type PendingNoteSelection } from "../NotePane/NotePane";
 import type { NoteSession } from "../../hooks/useNoteSession";
+import type { TextRange } from "../../lib/noteInsertion";
 
 interface ChatAreaProps {
   /** The book being read, or nothing while it is still being read in. */
@@ -38,6 +39,13 @@ interface ChatAreaProps {
   searchHighlights?: SearchSelections;
   /** The book's note, which the pane's other tab holds. */
   note: NoteSession;
+  noteEditorRange?: TextRange;
+  onNoteEditorRangeChange?: (range: TextRange) => void;
+  pendingNoteSelection?: PendingNoteSelection;
+  noteSelectionSaveError?: string | null;
+  noteSelectionSaving?: boolean;
+  onQuickNoteSubmit?: (text: string) => Promise<boolean>;
+  onQuickNoteRetry?: () => Promise<boolean>;
 }
 
 /** What each tab is called, and the order they sit in. */
@@ -53,21 +61,57 @@ const TABS: { tab: RightPaneTab; label: string }[] = [
  * over one, takes its room out of the page — and the page is what the reader
  * opened the book for.
  */
-function PaneTabs({ tab, onChange }: { tab: RightPaneTab; onChange: (tab: RightPaneTab) => void }) {
+function PaneTabs({
+  idBase,
+  tab,
+  onChange,
+}: {
+  idBase: string;
+  tab: RightPaneTab;
+  onChange: (tab: RightPaneTab) => void;
+}) {
+  const buttons = useRef<Array<HTMLButtonElement | null>>([]);
+
+  const selectAndFocus = (index: number) => {
+    onChange(TABS[index].tab);
+    buttons.current[index]?.focus();
+  };
+
   return (
     <div
       role="tablist"
       aria-label="チャットとメモ"
       className="flex shrink-0 border-b border-gray-200"
     >
-      {TABS.map((entry) => (
+      {TABS.map((entry, index) => (
         <button
           key={entry.tab}
+          ref={(button) => {
+            buttons.current[index] = button;
+          }}
           type="button"
           role="tab"
+          id={`${idBase}-tab-${entry.tab}`}
+          aria-controls={`${idBase}-panel-${entry.tab}`}
           aria-selected={tab === entry.tab}
+          tabIndex={tab === entry.tab ? 0 : -1}
           onClick={() => onChange(entry.tab)}
-          className={`cursor-pointer px-4 py-2 text-sm ${
+          onKeyDown={(event) => {
+            const next =
+              event.key === "ArrowRight"
+                ? (index + 1) % TABS.length
+                : event.key === "ArrowLeft"
+                  ? (index - 1 + TABS.length) % TABS.length
+                  : event.key === "Home"
+                    ? 0
+                    : event.key === "End"
+                      ? TABS.length - 1
+                      : null;
+            if (next === null) return;
+            event.preventDefault();
+            selectAndFocus(next);
+          }}
+          className={`h-11 cursor-pointer px-4 text-sm ${
             tab === entry.tab
               ? "border-b-2 border-blue-600 font-medium text-blue-700"
               : "text-gray-500 hover:text-gray-700"
@@ -97,8 +141,16 @@ export function ChatArea({
   deleteHighlight,
   searchHighlights,
   note,
+  noteEditorRange,
+  onNoteEditorRangeChange,
+  pendingNoteSelection,
+  noteSelectionSaveError,
+  noteSelectionSaving,
+  onQuickNoteSubmit,
+  onQuickNoteRetry,
 }: ChatAreaProps) {
   const [tab, setTab] = useAtom(rightPaneTabAtom);
+  const tabIdBase = useId();
   const [activeSelection, setActiveSelection] = useAtom(activeSelectionAtom);
   const { highlights, removeHighlight } = useHighlights(book?.id, undefined, deleteHighlight);
   const { query, setQuery, submit, matchedIds, searchError } = useHighlightSearch(
@@ -203,14 +255,41 @@ export function ChatArea({
 
   return (
     <div className="flex h-full flex-col bg-white">
-      <PaneTabs tab={tab} onChange={setTab} />
-      {/* Both are kept mounted only in the sense that switching back returns to
-          the same session: the note's text lives in `useNoteSession`, above
-          this component, so a tab left and come back to has whatever was typed
-          in it and whatever is still waiting to be saved. */}
-      {/* One box for either tab, so what is in it can size itself against the
-          room left over rather than against the pane the tab bar is also in. */}
-      <div className="min-h-0 flex-1">{tab === "note" ? <NotePane session={note} /> : body}</div>
+      <PaneTabs idBase={tabIdBase} tab={tab} onChange={setTab} />
+      {/* Keep both panel shells in the accessibility tree's relationship graph.
+          Only the selected panel owns content, so switching tabs preserves the
+          previous unmount semantics while every tab's `aria-controls` still
+          names an element that actually exists. */}
+      {TABS.map((entry) => {
+        const selected = tab === entry.tab;
+        return (
+          <div
+            key={entry.tab}
+            role="tabpanel"
+            id={`${tabIdBase}-panel-${entry.tab}`}
+            aria-labelledby={`${tabIdBase}-tab-${entry.tab}`}
+            hidden={!selected}
+            className="min-h-0 flex-1"
+          >
+            {selected && entry.tab === "note" ? (
+              <NotePane
+                session={note}
+                editorRange={noteEditorRange}
+                onEditorRangeChange={onNoteEditorRangeChange}
+                selections={book.selections}
+                onSelectionClick={onSelectionClick}
+                pendingSelection={pendingNoteSelection}
+                selectionSaveError={noteSelectionSaveError}
+                selectionSaving={noteSelectionSaving}
+                onQuickSubmit={onQuickNoteSubmit}
+                onQuickRetry={onQuickNoteRetry}
+              />
+            ) : selected ? (
+              body
+            ) : null}
+          </div>
+        );
+      })}
     </div>
   );
 }

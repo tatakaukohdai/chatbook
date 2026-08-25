@@ -1,6 +1,5 @@
 import { useCallback, useState } from "react";
 import { useSetAtom } from "jotai";
-import type { ResultAsync } from "neverthrow";
 import {
   activeSelectionAtom,
   chatMessagesAtom,
@@ -8,33 +7,13 @@ import {
   chatSheetAtom,
 } from "../atoms/chatAtom";
 import { useIsNarrow } from "./useIsNarrow";
-import { resultFetcher, type ApiError } from "../lib/fetcher";
-import {
-  createdSelectionSchema,
-  type CreatedSelection,
-  type PositionData,
-} from "../../shared/schemas/selection";
+import type { CreatedSelection } from "../../shared/schemas/selection";
 import { useChatStream } from "./useChatStream";
+import { useStoreSelection, type SaveSelection, type SelectionDraft } from "./useStoreSelection";
 
-/** A highlight the reader has just drawn, before the server has an id for it. */
-export interface SelectionDraft {
-  selectedText: string;
-  pageNumber: number;
-  /** Sent whole; the endpoint keeps only `rects` and `pageWidth`. */
-  positionData: PositionData;
-}
-
-export type SaveSelection = (
-  pdfId: string,
-  draft: SelectionDraft,
-) => ResultAsync<CreatedSelection, ApiError>;
-
-const storeSelection: SaveSelection = (pdfId, draft) =>
-  resultFetcher(`/api/pdf/${pdfId}/selections`, createdSelectionSchema, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(draft),
-  });
+// Keep the old type import path working for existing callers while the storage
+// concern itself lives in `useStoreSelection`.
+export type { SaveSelection, SelectionDraft } from "./useStoreSelection";
 
 /**
  * Turn a passage the reader has just marked into a highlight and a question
@@ -48,7 +27,7 @@ const storeSelection: SaveSelection = (pdfId, draft) =>
  */
 export function useAskAboutSelection(
   addHighlight: (selection: CreatedSelection) => void,
-  saveSelection: SaveSelection = storeSelection,
+  saveSelection?: SaveSelection,
 ) {
   const setActiveSelection = useSetAtom(activeSelectionAtom);
   const setChatMessages = useSetAtom(chatMessagesAtom);
@@ -56,15 +35,16 @@ export function useAskAboutSelection(
   const setChatPanelOpen = useSetAtom(chatPanelOpenAtom);
   const isNarrow = useIsNarrow();
   const { sendMessage } = useChatStream();
+  const { store } = useStoreSelection(addHighlight, saveSelection);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const clearSaveError = useCallback(() => setSaveError(null), []);
 
   const askAboutSelection = useCallback(
     (pdfId: string, draft: SelectionDraft, question: string, useWebSearch: boolean) => {
-      setSaveError(null);
+      clearSaveError();
 
-      return saveSelection(pdfId, draft)
+      return store(pdfId, draft)
         .andTee((selection) => {
-          addHighlight(selection);
           setActiveSelection({
             id: selection.id,
             selectedText: selection.selectedText,
@@ -92,16 +72,16 @@ export function useAskAboutSelection(
         });
     },
     [
-      addHighlight,
       isNarrow,
-      saveSelection,
+      clearSaveError,
       sendMessage,
       setActiveSelection,
       setChatMessages,
       setChatPanelOpen,
       setChatSheet,
+      store,
     ],
   );
 
-  return { askAboutSelection, saveError };
+  return { askAboutSelection, saveError, clearSaveError };
 }

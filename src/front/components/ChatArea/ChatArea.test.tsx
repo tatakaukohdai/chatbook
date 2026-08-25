@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vite-plus/test";
-import { render, screen, act, waitFor } from "@testing-library/react";
+import { render, screen, act, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Provider, createStore } from "jotai";
 import { okAsync, ResultAsync } from "neverthrow";
@@ -26,6 +26,8 @@ import type { SearchSelections } from "../../hooks/useHighlightSearch";
 import { SwrTestCache } from "../../../test/swrTestCache";
 import { stubNoteSession } from "../../../test/noteSession";
 import type { NoteSession } from "../../hooks/useNoteSession";
+import type { SelectionDraft } from "../../hooks/useStoreSelection";
+import { PHONE_WIDTH, setViewportWidth } from "../../../test/viewport";
 
 const SELECTED_TEXT = "エッジはサーバーレス実行基盤で、実行単位をまたいでメモリを共有できません。";
 const OTHER_TEXT = "Durable Objects は単一のインスタンスに処理を集約します。";
@@ -82,6 +84,10 @@ function renderChat(
     searchHighlights?: SearchSelections;
     /** The book's note, for the tests about the pane's other tab. */
     note?: NoteSession;
+    /** A passage waiting for the narrow quick-note input. */
+    pendingSelection?: SelectionDraft;
+    onQuickSubmit?: (text: string) => Promise<boolean>;
+    onQuickRetry?: () => Promise<boolean>;
   } = {},
 ) {
   const {
@@ -91,6 +97,9 @@ function renderChat(
     deleteHighlight,
     searchHighlights,
     note,
+    pendingSelection,
+    onQuickSubmit,
+    onQuickRetry,
   } = options;
   const book = bookError ? undefined : BOOK;
   const store = createStore();
@@ -116,6 +125,9 @@ function renderChat(
           deleteHighlight={deleteHighlight}
           searchHighlights={searchHighlights}
           note={note ?? stubNoteSession()}
+          pendingNoteSelection={pendingSelection}
+          onQuickNoteSubmit={onQuickSubmit}
+          onQuickNoteRetry={onQuickRetry}
         />
       </Provider>
     </SwrTestCache>,
@@ -406,6 +418,91 @@ describe("ChatArea", () => {
       renderChat({ bookError: new Error("回線が切れました") });
 
       expect(screen.queryByRole("tab", { name: "メモ" })).not.toBeInTheDocument();
+    });
+
+    it("wires the pending selection and quick-submit action into the note pane", async () => {
+      setViewportWidth(PHONE_WIDTH);
+      const submitted: string[] = [];
+      renderChat({
+        pendingSelection: {
+          requestId: "7e0055d7-5bc3-40af-bab4-4db62a9f8ef9",
+          selectedText: "選んだ箇所",
+          pageNumber: 42,
+          positionData: { rects: [] },
+        },
+        onQuickSubmit: async (text) => {
+          submitted.push(text);
+          return true;
+        },
+      });
+
+      await userEvent.click(screen.getByRole("tab", { name: "メモ" }));
+      expect(screen.getByText("選んだ箇所")).toBeInTheDocument();
+      await userEvent.type(screen.getByRole("textbox", { name: "クイックメモ" }), "補足");
+      await userEvent.click(screen.getByRole("button", { name: "メモを追加" }));
+
+      expect(submitted).toStrictEqual(["補足"]);
+    });
+
+    it("keeps the controlled quick input when switching tabs unmounts the note pane", async () => {
+      setViewportWidth(PHONE_WIDTH);
+      renderChat();
+      await userEvent.click(screen.getByRole("tab", { name: "メモ" }));
+      await userEvent.type(screen.getByRole("textbox", { name: "クイックメモ" }), "タブをまたぐ");
+
+      await userEvent.click(screen.getByRole("tab", { name: "チャット" }));
+      await userEvent.click(screen.getByRole("tab", { name: "メモ" }));
+
+      expect(screen.getByRole("textbox", { name: "クイックメモ" })).toHaveValue("タブをまたぐ");
+    });
+
+    it("keeps both mobile tabs named and exposes which one is selected", async () => {
+      setViewportWidth(PHONE_WIDTH);
+      renderChat();
+
+      const tabs = screen.getByRole("tablist", { name: "チャットとメモ" });
+      const chat = within(tabs).getByRole("tab", { name: "チャット" });
+      const note = within(tabs).getByRole("tab", { name: "メモ" });
+      expect(chat).toHaveAttribute("aria-selected", "true");
+      expect(chat).toHaveClass("h-11");
+      expect(note).toHaveClass("h-11");
+      await userEvent.click(note);
+      expect(note).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByRole("textbox", { name: "クイックメモ" })).toHaveClass("h-11");
+      expect(screen.getByRole("button", { name: "メモを追加" })).toHaveClass("h-11");
+    });
+
+    it("links tabs to their panel and moves selection and focus with the tab keys", async () => {
+      renderChat();
+      const chat = screen.getByRole("tab", { name: "チャット" });
+      const note = screen.getByRole("tab", { name: "メモ" });
+
+      expect(chat).toHaveAttribute("tabindex", "0");
+      expect(note).toHaveAttribute("tabindex", "-1");
+      expect(chat).toHaveAttribute("aria-controls");
+      expect(document.getElementById(chat.getAttribute("aria-controls")!)).not.toBeNull();
+      expect(document.getElementById(note.getAttribute("aria-controls")!)).not.toBeNull();
+      expect(screen.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", chat.id);
+      expect(screen.getByRole("tabpanel")).toHaveAttribute(
+        "id",
+        chat.getAttribute("aria-controls"),
+      );
+
+      chat.focus();
+      await userEvent.keyboard("{ArrowRight}");
+      expect(note).toHaveFocus();
+      expect(note).toHaveAttribute("aria-selected", "true");
+      expect(note).toHaveAttribute("tabindex", "0");
+      expect(document.getElementById(chat.getAttribute("aria-controls")!)).not.toBeNull();
+      expect(document.getElementById(note.getAttribute("aria-controls")!)).not.toBeNull();
+      expect(screen.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", note.id);
+
+      await userEvent.keyboard("{Home}");
+      expect(chat).toHaveFocus();
+      await userEvent.keyboard("{End}");
+      expect(note).toHaveFocus();
+      await userEvent.keyboard("{ArrowLeft}");
+      expect(chat).toHaveFocus();
     });
   });
 });

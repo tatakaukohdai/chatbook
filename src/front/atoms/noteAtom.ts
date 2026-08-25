@@ -16,3 +16,13 @@ export type RightPaneTab = "chat" | "note";
  * not a setting.
  */
 export const rightPaneTabAtom = atom<RightPaneTab>("chat");
+
+/**
+ * The one-line note being prepared on a narrow screen.
+ *
+ * Kept in the reader's per-book store rather than `NotePane`: changing tabs or
+ * closing the sheet unmounts that pane, but neither means the reader discarded
+ * what they typed. Only the pane subscribes, so one character does not render
+ * the whole `BookReader` and its PDF again.
+ */
+export const quickNoteInputAtom = atom("");
